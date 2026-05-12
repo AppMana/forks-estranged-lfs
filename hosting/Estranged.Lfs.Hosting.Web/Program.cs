@@ -16,6 +16,7 @@ using Estranged.Lfs.Adapter.S3;
 using Estranged.Lfs.Api;
 using Estranged.Lfs.Authenticator.BitBucket;
 using Estranged.Lfs.Authenticator.GitHub;
+using Estranged.Lfs.Authenticator.Keycloak;
 using Estranged.Lfs.Data;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -39,6 +40,9 @@ string ghOrg       = cfg["GITHUB_ORGANISATION"];
 string ghRepo      = cfg["GITHUB_REPOSITORY"];
 string bbWs        = cfg["BITBUCKET_WORKSPACE"];
 string bbRepo      = cfg["BITBUCKET_REPOSITORY"];
+string kcRealmUrl  = cfg["KEYCLOAK_REALM_URL"];
+string kcRole      = cfg["KEYCLOAK_ROLE"] ?? "lfs";
+string kcPrefix    = cfg["KEYCLOAK_CLIENT_PREFIX"] ?? "git-lfs-";
 bool   s3Accel     = bool.Parse(cfg["S3_ACCELERATION"] ?? "false");
 string azConn      = cfg["LFS_AZUREBLOB_CONNECTIONSTRING"];
 string azContainer = cfg["LFS_AZUREBLOB_CONTAINERNAME"];
@@ -49,17 +53,20 @@ bool isAzure     = !string.IsNullOrWhiteSpace(azConn);
 bool isDictAuth  = !string.IsNullOrWhiteSpace(lfsUser) && !string.IsNullOrWhiteSpace(lfsPass);
 bool isGhAuth    = !string.IsNullOrWhiteSpace(ghOrg)   && !string.IsNullOrWhiteSpace(ghRepo);
 bool isBbAuth    = !string.IsNullOrWhiteSpace(bbWs)    && !string.IsNullOrWhiteSpace(bbRepo);
+bool isKcAuth    = !string.IsNullOrWhiteSpace(kcRealmUrl);
 
-if (new[] { isDictAuth, isGhAuth, isBbAuth }.Count(x => x) != 1)
+if (new[] { isDictAuth, isGhAuth, isBbAuth, isKcAuth }.Count(x => x) != 1)
     throw new InvalidOperationException(
         "Set exactly one auth backend: LFS_USERNAME+LFS_PASSWORD, " +
-        "GITHUB_ORGANISATION+GITHUB_REPOSITORY, or BITBUCKET_WORKSPACE+BITBUCKET_REPOSITORY.");
+        "GITHUB_ORGANISATION+GITHUB_REPOSITORY, BITBUCKET_WORKSPACE+BITBUCKET_REPOSITORY, " +
+        "or KEYCLOAK_REALM_URL.");
 
 var services = builder.Services;
 
 if      (isDictAuth) services.AddLfsDictionaryAuthenticator(new Dictionary<string, string> { { lfsUser, lfsPass } });
 else if (isGhAuth)   services.AddLfsGitHubAuthenticator(new GitHubAuthenticatorConfig    { Organisation = ghOrg, Repository = ghRepo });
 else if (isBbAuth)   services.AddLfsBitBucketAuthenticator(new BitBucketAuthenticatorConfig { Workspace = bbWs, Repository = bbRepo });
+else if (isKcAuth)   services.AddLfsKeycloakAuthenticator(new KeycloakAuthenticatorConfig { RealmUrl = kcRealmUrl, RequiredRole = kcRole, ClientPrefix = kcPrefix });
 
 if (isS3)
 {
@@ -82,7 +89,16 @@ if (isS3)
     AmazonS3Client s3Client = !string.IsNullOrWhiteSpace(awsAk) && !string.IsNullOrWhiteSpace(awsSk)
         ? new AmazonS3Client(new BasicAWSCredentials(awsAk, awsSk), s3Config)
         : new AmazonS3Client(s3Config);
-    services.AddLfsS3Adapter(new S3BlobAdapterConfig { Bucket = lfsBucket }, s3Client);
+    services.AddSingleton<IAmazonS3>(s3Client);
+    services.AddHttpContextAccessor();
+    services.AddScoped<IBlobAdapter>(sp =>
+    {
+        var http = sp.GetRequiredService<IHttpContextAccessor>().HttpContext;
+        string org = http?.Request.RouteValues.TryGetValue("org", out object orgValue) == true ? orgValue?.ToString() : null;
+        string repo = http?.Request.RouteValues.TryGetValue("repo", out object repoValue) == true ? repoValue?.ToString() : null;
+        string keyPrefix = string.IsNullOrWhiteSpace(org) || string.IsNullOrWhiteSpace(repo) ? "" : $"{org}/{repo}/";
+        return new S3BlobAdapter(sp.GetRequiredService<IAmazonS3>(), new S3BlobAdapterConfig { Bucket = lfsBucket, KeyPrefix = keyPrefix });
+    });
 }
 else if (isAzure)
 {

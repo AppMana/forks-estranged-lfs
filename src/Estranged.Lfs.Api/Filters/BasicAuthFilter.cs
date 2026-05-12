@@ -30,6 +30,11 @@ namespace Estranged.Lfs.Api.Filters
             context.Result = new StatusCodeResult(401);
         }
 
+        private void Forbidden(ActionExecutingContext context)
+        {
+            context.Result = new StatusCodeResult(403);
+        }
+
         private (string Username, string Password) GetCredentials(IHeaderDictionary headers)
         {
             if (!headers.ContainsKey(AuthorizationHeader))
@@ -54,7 +59,11 @@ namespace Estranged.Lfs.Api.Filters
             byte[] decoded = Convert.FromBase64String(auth);
             Encoding iso = Encoding.GetEncoding("ISO-8859-1");
 
-            string[] authPair = iso.GetString(decoded).Split(':');
+            string[] authPair = iso.GetString(decoded).Split(new[] { ':' }, 2);
+            if (authPair.Length != 2)
+            {
+                throw new InvalidOperationException("Authorization header does not contain username and password.");
+            }
 
             return (authPair[0], authPair[1]);
         }
@@ -78,7 +87,15 @@ namespace Estranged.Lfs.Api.Filters
 
             try
             {
-                await authenticator.Authenticate(username, password, GetRequiredPermission(context.HttpContext.Request), CancellationToken.None).ConfigureAwait(false);
+                string organisation = context.RouteData.Values.TryGetValue("org", out object org) ? org?.ToString() : null;
+                string repository = context.RouteData.Values.TryGetValue("repo", out object repo) ? repo?.ToString() : null;
+                await authenticator.Authenticate(username, password, organisation, repository, GetRequiredPermission(context.HttpContext.Request), CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                logger.LogError(e, $"Forbidden by {authenticator.GetType().Name}");
+                Forbidden(context);
+                return;
             }
             catch (Exception e)
             {

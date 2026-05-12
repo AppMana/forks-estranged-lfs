@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Version>5.0.0</Version>
+    <TargetFramework>net8.0</TargetFramework>
+    <Authors>AppMana</Authors>
+    <Description>Keycloak client-credentials authenticator for Estranged.Lfs.Api.</Description>
+    <PackageId>Estranged.Lfs.Authenticator.Keycloak</PackageId>
+    <AssemblyName>Estranged.Lfs.Authenticator.Keycloak</AssemblyName>
+    <RootNamespace>Estranged.Lfs.Authenticator.Keycloak</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Estranged.Lfs.Data\Estranged.Lfs.Data.csproj" />
+  </ItemGroup>
+
+</Project>

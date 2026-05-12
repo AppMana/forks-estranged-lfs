@@ -16,20 +16,20 @@ namespace Estranged.Lfs.Authenticator.GitHub
             this.clientFactory = clientFactory;
         }
 
-        public async Task Authenticate(string username, string password, LfsPermission requiredPermission, CancellationToken token)
+        public async Task Authenticate(string username, string password, string organisation, string repository, LfsPermission requiredPermission, CancellationToken token)
         {
             var client = clientFactory.CreateClient(config.BaseAddress, username, password);
 
-            var repository = await client.Get(config.Organisation, config.Repository);
+            var githubRepository = await client.Get(config.Organisation, config.Repository);
 
             LfsPermission actualPermission = LfsPermission.None;
 
-            if (repository.Permissions.Pull)
+            if (githubRepository.Permissions.Pull)
             {
                 actualPermission |= LfsPermission.Read;
             }
 
-            if (repository.Permissions.Push)
+            if (githubRepository.Permissions.Push)
             {
                 actualPermission |= LfsPermission.Write;
             }

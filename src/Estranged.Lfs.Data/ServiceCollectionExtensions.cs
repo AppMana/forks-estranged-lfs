@@ -7,7 +7,7 @@ namespace Estranged.Lfs.Data
     {
         public static IServiceCollection AddLfsData(this IServiceCollection services)
         {
-            return services.AddSingleton<IObjectManager, ObjectManager>();
+            return services.AddScoped<IObjectManager, ObjectManager>();
         }
 
         public static IServiceCollection AddLfsDictionaryAuthenticator(this IServiceCollection services, IReadOnlyDictionary<string, string> credentials)

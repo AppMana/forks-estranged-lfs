@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 
 namespace Estranged.Lfs.Api.Controllers
 {
-    [Route("objects")]
+    [Route("{org}/{repo}/objects")]
     public class ObjectsController : ControllerBase
     {
         private readonly IObjectManager objectManager;

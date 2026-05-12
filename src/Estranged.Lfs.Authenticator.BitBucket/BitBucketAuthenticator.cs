@@ -15,7 +15,7 @@ namespace Estranged.Lfs.Authenticator.BitBucket
             this.clientFactory = clientFactory;
         }
 
-        public async Task Authenticate(string username, string password, LfsPermission requiredPermission, CancellationToken token)
+        public async Task Authenticate(string username, string password, string organisation, string repository, LfsPermission requiredPermission, CancellationToken token)
         {
             var client = clientFactory.CreateClient(config.BaseAddress, username, password);
 

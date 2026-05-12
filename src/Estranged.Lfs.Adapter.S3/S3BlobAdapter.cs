@@ -8,7 +8,7 @@ using System.Threading.Tasks;
 
 namespace Estranged.Lfs.Adapter.S3
 {
-    internal sealed class S3BlobAdapter : IBlobAdapter
+    public sealed class S3BlobAdapter : IBlobAdapter
     {
         private readonly IAmazonS3 client;
         private readonly IS3BlobAdapterConfig config;

@@ -14,7 +14,7 @@ namespace Estranged.Lfs.Data
             this.credentials = credentials;
         }
 
-        public Task Authenticate(string username, string password, LfsPermission requiredPermission, CancellationToken token)
+        public Task Authenticate(string username, string password, string organisation, string repository, LfsPermission requiredPermission, CancellationToken token)
         {
             if (!credentials.ContainsKey(username) || credentials[username] != password)
             {

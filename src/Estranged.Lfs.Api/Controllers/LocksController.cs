@@ -2,7 +2,7 @@
 
 namespace Estranged.Lfs.Api.Controllers
 {
-    [Route("locks")]
+    [Route("{org}/{repo}/locks")]
     public class LocksController : ControllerBase
     {
         [HttpPost("verify")]
