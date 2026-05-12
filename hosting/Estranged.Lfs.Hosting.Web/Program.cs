@@ -8,6 +8,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using Amazon;
 using Amazon.Runtime;
 using Amazon.S3;
@@ -52,6 +53,7 @@ string fallbackRegion = cfg["LFS_FALLBACK_AWS_REGION"] ?? cfg["AWS_REGION"] ?? c
 string fallbackAk     = cfg["LFS_FALLBACK_AWS_ACCESS_KEY_ID"];
 string fallbackSk     = cfg["LFS_FALLBACK_AWS_SECRET_ACCESS_KEY"];
 string fallbackEndpoint = cfg["LFS_FALLBACK_AWS_ENDPOINT_URL_S3"];
+string fallbacksJson = cfg["LFS_FALLBACKS_JSON"];
 
 bool isS3        = !string.IsNullOrWhiteSpace(lfsBucket);
 bool isAzure     = !string.IsNullOrWhiteSpace(azConn);
@@ -103,9 +105,22 @@ if (isS3)
         !string.IsNullOrWhiteSpace(fallbackAk) &&
         !string.IsNullOrWhiteSpace(fallbackSk))
     {
-        services.AddSingleton(new FallbackS3(
+        services.AddSingleton<IEnumerable<FallbackS3>>(new[]
+        {
+            new FallbackS3(
             CreateS3Client(fallbackEndpoint, fallbackRegion, fallbackAk, fallbackSk, false),
-            new S3BlobAdapterConfig { Bucket = fallbackBucket, KeyPrefix = "" }));
+            new S3BlobAdapterConfig { Bucket = fallbackBucket, KeyPrefix = "" })
+        });
+    }
+    else if (!string.IsNullOrWhiteSpace(fallbacksJson))
+    {
+        var fallbackDefs = JsonSerializer.Deserialize<List<S3FallbackConfig>>(fallbacksJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true }) ?? new();
+        services.AddSingleton<IEnumerable<FallbackS3>>(fallbackDefs
+            .Where(x => !string.IsNullOrWhiteSpace(x.Bucket) && !string.IsNullOrWhiteSpace(x.AccessKeyId) && !string.IsNullOrWhiteSpace(x.SecretAccessKey))
+            .Select(x => new FallbackS3(
+                CreateS3Client(x.EndpointUrl, x.Region ?? fallbackRegion, x.AccessKeyId, x.SecretAccessKey, false),
+                new S3BlobAdapterConfig { Bucket = x.Bucket, KeyPrefix = x.KeyPrefix ?? "" }))
+            .ToList());
     }
     services.AddHttpContextAccessor();
     services.AddScoped<IBlobAdapter>(sp =>
@@ -115,8 +130,10 @@ if (isS3)
         string repo = http?.Request.RouteValues.TryGetValue("repo", out object repoValue) == true ? repoValue?.ToString() : null;
         string keyPrefix = string.IsNullOrWhiteSpace(org) || string.IsNullOrWhiteSpace(repo) ? "" : $"{org}/{repo}/";
         IBlobAdapter primary = new S3BlobAdapter(sp.GetRequiredService<IAmazonS3>(), new S3BlobAdapterConfig { Bucket = lfsBucket, KeyPrefix = keyPrefix });
-        FallbackS3 fallback = sp.GetService<FallbackS3>();
-        return fallback == null ? primary : new FallbackBlobAdapter(primary, new S3BlobAdapter(fallback.Client, fallback.Config));
+        var fallbacks = sp.GetService<IEnumerable<FallbackS3>>()?
+            .Select(x => new S3BlobAdapter(x.Client, x.Config))
+            .ToList();
+        return fallbacks == null || fallbacks.Count == 0 ? primary : new FallbackBlobAdapter(primary, fallbacks);
     });
 }
 else if (isAzure)
@@ -140,3 +157,10 @@ app.UseEndpoints(e => e.MapControllers());
 app.Run();
 
 sealed record FallbackS3(AmazonS3Client Client, S3BlobAdapterConfig Config);
+sealed record S3FallbackConfig(
+    string Bucket,
+    string KeyPrefix,
+    string Region,
+    string EndpointUrl,
+    string AccessKeyId,
+    string SecretAccessKey);
