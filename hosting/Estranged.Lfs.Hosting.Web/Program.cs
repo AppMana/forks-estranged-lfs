@@ -7,8 +7,12 @@
 // AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY for SeaweedFS targeting.
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Text.Json;
+using System.Threading.Tasks;
+using System.Xml.Linq;
 using Amazon;
 using Amazon.Runtime;
 using Amazon.S3;
@@ -48,6 +52,10 @@ bool   s3Accel     = bool.Parse(cfg["S3_ACCELERATION"] ?? "false");
 string azConn      = cfg["LFS_AZUREBLOB_CONNECTIONSTRING"];
 string azContainer = cfg["LFS_AZUREBLOB_CONTAINERNAME"];
 string s3Endpoint  = cfg["AWS_ENDPOINT_URL_S3"];     // SeaweedFS S3 endpoint, optional
+string stsEndpoint = cfg["AWS_ENDPOINT_URL_STS"];    // SeaweedFS STS endpoint, optional
+string webIdentityTokenFile = cfg["AWS_WEB_IDENTITY_TOKEN_FILE"];
+string roleArn = cfg["AWS_ROLE_ARN"];
+string roleSessionName = cfg["AWS_ROLE_SESSION_NAME"] ?? "estranged-lfs";
 string fallbackBucket = cfg["LFS_FALLBACK_BUCKET"];  // old AWS LFS bucket, optional read-through only
 string fallbackRegion = cfg["LFS_FALLBACK_AWS_REGION"] ?? cfg["AWS_REGION"] ?? cfg["AWS_DEFAULT_REGION"];
 string fallbackAk     = cfg["LFS_FALLBACK_AWS_ACCESS_KEY_ID"];
@@ -70,7 +78,7 @@ if (new[] { isDictAuth, isGhAuth, isBbAuth, isKcAuth }.Count(x => x) != 1)
 
 var services = builder.Services;
 
-static AmazonS3Client CreateS3Client(string endpoint, string region, string accessKey, string secretKey, bool accelerate)
+static AmazonS3Client CreateS3Client(string endpoint, string region, string accessKey, string secretKey, bool accelerate, string stsEndpoint = null, string roleArn = null, string roleSessionName = null, string webIdentityTokenFile = null)
 {
     var s3Config = new AmazonS3Config { UseAccelerateEndpoint = accelerate };
     if (!string.IsNullOrWhiteSpace(region))
@@ -80,9 +88,11 @@ static AmazonS3Client CreateS3Client(string endpoint, string region, string acce
         s3Config.ServiceURL = endpoint;
         s3Config.ForcePathStyle = true;
     }
-    return !string.IsNullOrWhiteSpace(accessKey) && !string.IsNullOrWhiteSpace(secretKey)
-        ? new AmazonS3Client(new BasicAWSCredentials(accessKey, secretKey), s3Config)
-        : new AmazonS3Client(s3Config);
+    if (!string.IsNullOrWhiteSpace(accessKey) && !string.IsNullOrWhiteSpace(secretKey))
+        return new AmazonS3Client(new BasicAWSCredentials(accessKey, secretKey), s3Config);
+    if (!string.IsNullOrWhiteSpace(stsEndpoint) && !string.IsNullOrWhiteSpace(roleArn) && !string.IsNullOrWhiteSpace(webIdentityTokenFile))
+        return new AmazonS3Client(new WebIdentityStsCredentials(stsEndpoint, roleArn, roleSessionName ?? "estranged-lfs", webIdentityTokenFile), s3Config);
+    return new AmazonS3Client(s3Config);
 }
 
 if      (isDictAuth) services.AddLfsDictionaryAuthenticator(new Dictionary<string, string> { { lfsUser, lfsPass } });
@@ -99,7 +109,7 @@ if (isS3)
     // pod's mounted Secret.
     string awsAk = cfg["AWS_ACCESS_KEY_ID"];
     string awsSk = cfg["AWS_SECRET_ACCESS_KEY"];
-    AmazonS3Client s3Client = CreateS3Client(s3Endpoint, awsRegion, awsAk, awsSk, s3Accel);
+    AmazonS3Client s3Client = CreateS3Client(s3Endpoint, awsRegion, awsAk, awsSk, s3Accel, stsEndpoint, roleArn, roleSessionName, webIdentityTokenFile);
     services.AddSingleton<IAmazonS3>(s3Client);
     if (!string.IsNullOrWhiteSpace(fallbackBucket) &&
         !string.IsNullOrWhiteSpace(fallbackAk) &&
@@ -164,3 +174,49 @@ sealed record S3FallbackConfig(
     string EndpointUrl,
     string AccessKeyId,
     string SecretAccessKey);
+
+sealed class WebIdentityStsCredentials : RefreshingAWSCredentials
+{
+    readonly string endpoint;
+    readonly string roleArn;
+    readonly string roleSessionName;
+    readonly string tokenFile;
+    static readonly HttpClient http = new();
+
+    public WebIdentityStsCredentials(string endpoint, string roleArn, string roleSessionName, string tokenFile)
+    {
+        this.endpoint = endpoint;
+        this.roleArn = roleArn;
+        this.roleSessionName = roleSessionName;
+        this.tokenFile = tokenFile;
+        PreemptExpiryTime = TimeSpan.FromMinutes(5);
+    }
+
+    protected override CredentialsRefreshState GenerateNewCredentials() =>
+        GenerateNewCredentialsAsync().GetAwaiter().GetResult();
+
+    protected override async Task<CredentialsRefreshState> GenerateNewCredentialsAsync()
+    {
+        string token = (await File.ReadAllTextAsync(tokenFile)).Trim();
+        using var form = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["Action"] = "AssumeRoleWithWebIdentity",
+            ["Version"] = "2011-06-15",
+            ["RoleArn"] = roleArn,
+            ["RoleSessionName"] = roleSessionName,
+            ["WebIdentityToken"] = token
+        });
+        using var response = await http.PostAsync(endpoint, form);
+        string body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"SeaweedFS STS returned {(int)response.StatusCode}: {body}");
+
+        var doc = XDocument.Parse(body);
+        string Text(string localName) => doc.Descendants().First(x => x.Name.LocalName == localName).Value;
+        var credentials = new ImmutableCredentials(
+            Text("AccessKeyId"),
+            Text("SecretAccessKey"),
+            Text("SessionToken"));
+        return new CredentialsRefreshState(credentials, DateTime.Parse(Text("Expiration")).ToUniversalTime());
+    }
+}
