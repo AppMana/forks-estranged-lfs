@@ -99,7 +99,9 @@ if (isS3)
     string awsSk = cfg["AWS_SECRET_ACCESS_KEY"];
     AmazonS3Client s3Client = CreateS3Client(s3Endpoint, awsRegion, awsAk, awsSk, s3Accel);
     services.AddSingleton<IAmazonS3>(s3Client);
-    if (!string.IsNullOrWhiteSpace(fallbackBucket))
+    if (!string.IsNullOrWhiteSpace(fallbackBucket) &&
+        !string.IsNullOrWhiteSpace(fallbackAk) &&
+        !string.IsNullOrWhiteSpace(fallbackSk))
     {
         services.AddSingleton(new FallbackS3(
             CreateS3Client(fallbackEndpoint, fallbackRegion, fallbackAk, fallbackSk, false),
