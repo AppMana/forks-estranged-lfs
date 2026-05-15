@@ -62,6 +62,28 @@ namespace Estranged.Lfs.Tests.Adapter.S3
         }
 
         [Fact]
+        public async Task DownloadDoesNotReturnSameOidFromAnotherRepositoryPrefix()
+        {
+            var mockClient = mockRepository.Create<IAmazonS3>();
+            const string oid = "d53de494a038b6a8ede0aea08c38bde00244b155924bf4c463d1de208faecee8";
+
+            mockClient.Setup(x => x.GetObjectMetadataAsync("my-bucket", $"AppMana/appmana/{oid}", CancellationToken.None))
+                      .ThrowsAsync(new AmazonS3Exception("Object not found", ErrorType.Sender, "NotFound", "requestId", HttpStatusCode.NotFound));
+
+            var adapter = new S3BlobAdapter(mockClient.Object, new S3BlobAdapterConfig
+            {
+                Bucket = "my-bucket",
+                KeyPrefix = "AppMana/appmana/"
+            });
+
+            var signedBlob = await adapter.UriForDownload(oid, CancellationToken.None);
+
+            Assert.Equal(404, signedBlob.ErrorCode);
+            mockClient.Verify(x => x.GetObjectMetadataAsync("my-bucket", oid, CancellationToken.None), Times.Never);
+            mockClient.Verify(x => x.GetObjectMetadataAsync("my-bucket", $"AppMana/Art-Workspace/{oid}", CancellationToken.None), Times.Never);
+        }
+
+        [Fact]
         public async Task TestUploadBlob()
         {
             var mockClient = mockRepository.Create<IAmazonS3>();
