@@ -48,6 +48,7 @@ string bbRepo      = cfg["BITBUCKET_REPOSITORY"];
 string kcRealmUrl  = cfg["KEYCLOAK_REALM_URL"];
 string kcRole      = cfg["KEYCLOAK_ROLE"] ?? "lfs";
 string kcPrefix    = cfg["KEYCLOAK_CLIENT_PREFIX"] ?? "git-lfs-";
+string kcAssertion = cfg["KEYCLOAK_ASSERTION_USERNAME"] ?? "assertion";
 bool   s3Accel     = bool.Parse(cfg["S3_ACCELERATION"] ?? "false");
 string azConn      = cfg["LFS_AZUREBLOB_CONNECTIONSTRING"];
 string azContainer = cfg["LFS_AZUREBLOB_CONTAINERNAME"];
@@ -98,7 +99,7 @@ static AmazonS3Client CreateS3Client(string endpoint, string region, string acce
 if      (isDictAuth) services.AddLfsDictionaryAuthenticator(new Dictionary<string, string> { { lfsUser, lfsPass } });
 else if (isGhAuth)   services.AddLfsGitHubAuthenticator(new GitHubAuthenticatorConfig    { Organisation = ghOrg, Repository = ghRepo });
 else if (isBbAuth)   services.AddLfsBitBucketAuthenticator(new BitBucketAuthenticatorConfig { Workspace = bbWs, Repository = bbRepo });
-else if (isKcAuth)   services.AddLfsKeycloakAuthenticator(new KeycloakAuthenticatorConfig { RealmUrl = kcRealmUrl, RequiredRole = kcRole, ClientPrefix = kcPrefix });
+else if (isKcAuth)   services.AddLfsKeycloakAuthenticator(new KeycloakAuthenticatorConfig { RealmUrl = kcRealmUrl, RequiredRole = kcRole, ClientPrefix = kcPrefix, AssertionUsername = kcAssertion });
 
 if (isS3)
 {

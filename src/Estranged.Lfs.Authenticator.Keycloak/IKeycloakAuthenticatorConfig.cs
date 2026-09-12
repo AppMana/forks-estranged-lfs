@@ -5,5 +5,6 @@ namespace Estranged.Lfs.Authenticator.Keycloak
         string RealmUrl { get; }
         string RequiredRole { get; }
         string ClientPrefix { get; }
+        string AssertionUsername { get; }
     }
 }

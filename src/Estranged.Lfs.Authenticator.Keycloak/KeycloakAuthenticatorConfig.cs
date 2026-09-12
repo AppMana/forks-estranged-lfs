@@ -5,5 +5,6 @@ namespace Estranged.Lfs.Authenticator.Keycloak
         public string RealmUrl { get; set; }
         public string RequiredRole { get; set; } = "lfs";
         public string ClientPrefix { get; set; } = "git-lfs-";
+        public string AssertionUsername { get; set; } = "assertion";
     }
 }

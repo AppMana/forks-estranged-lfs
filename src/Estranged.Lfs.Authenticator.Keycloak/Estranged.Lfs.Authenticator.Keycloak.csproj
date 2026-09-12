@@ -15,4 +15,8 @@
     <ProjectReference Include="..\Estranged.Lfs.Data\Estranged.Lfs.Data.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Estranged.Lfs.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -35,18 +35,52 @@ namespace Estranged.Lfs.Authenticator.Keycloak
                 throw new InvalidOperationException("LFS route did not include organisation and repository.");
             }
 
-            string expectedClientId = $"{config.ClientPrefix}{organisation}-{repository}";
-            if (!string.IsNullOrWhiteSpace(username) && username != "x" && username != "t" && username != expectedClientId)
-            {
-                throw new UnauthorizedAccessException($"Credential username {username} does not match {expectedClientId}.");
-            }
-
             if (string.IsNullOrWhiteSpace(password))
             {
-                throw new InvalidOperationException("No Keycloak client secret was supplied.");
+                throw new InvalidOperationException("No Keycloak credential was supplied.");
             }
 
-            string cacheKey = $"{expectedClientId}:{Hash(password)}";
+            string repositoryClientId = $"{config.ClientPrefix}{organisation}-{repository}";
+            string clientId;
+            Dictionary<string, string> grant;
+            if (username == config.AssertionUsername)
+            {
+                // The password is a Kubernetes ServiceAccount token. Keycloak
+                // verifies it against the cluster issuer and only accepts it
+                // for the client bound to exactly this subject, so the subject
+                // read here is only used to name that client.
+                string subject = SubjectClaim(password);
+                if (string.IsNullOrWhiteSpace(subject))
+                {
+                    throw new InvalidOperationException("Workload assertion does not carry a subject.");
+                }
+
+                clientId = AssertionClientId(config.ClientPrefix, organisation, repository, subject);
+                grant = new Dictionary<string, string>
+                {
+                    ["grant_type"] = "client_credentials",
+                    ["client_id"] = clientId,
+                    ["client_assertion_type"] = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                    ["client_assertion"] = password,
+                };
+            }
+            else
+            {
+                if (!string.IsNullOrWhiteSpace(username) && username != "x" && username != "t" && username != repositoryClientId)
+                {
+                    throw new UnauthorizedAccessException($"Credential username {username} does not match {repositoryClientId}.");
+                }
+
+                clientId = repositoryClientId;
+                grant = new Dictionary<string, string>
+                {
+                    ["grant_type"] = "client_credentials",
+                    ["client_id"] = clientId,
+                    ["client_secret"] = password,
+                };
+            }
+
+            string cacheKey = $"{clientId}:{Hash(password)}";
             if (cache.TryGetValue(cacheKey, out CacheEntry cached) && cached.ExpiresAt > DateTimeOffset.UtcNow)
             {
                 return;
@@ -54,27 +88,65 @@ namespace Estranged.Lfs.Authenticator.Keycloak
 
             using var response = await httpClient.PostAsync(
                 $"{config.RealmUrl.TrimEnd('/')}/protocol/openid-connect/token",
-                new FormUrlEncodedContent(new Dictionary<string, string>
-                {
-                    ["grant_type"] = "client_credentials",
-                    ["client_id"] = expectedClientId,
-                    ["client_secret"] = password,
-                }),
+                new FormUrlEncodedContent(grant),
                 token).ConfigureAwait(false);
 
             if (!response.IsSuccessStatusCode)
             {
-                throw new InvalidOperationException($"Keycloak rejected client credentials for {expectedClientId}: {(int)response.StatusCode}");
+                throw new InvalidOperationException($"Keycloak rejected client credentials for {clientId}: {(int)response.StatusCode}");
             }
 
             using JsonDocument doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token).ConfigureAwait(false));
             string accessToken = doc.RootElement.GetProperty("access_token").GetString();
             if (!HasRealmRole(accessToken, config.RequiredRole))
             {
-                throw new UnauthorizedAccessException($"Keycloak token for {expectedClientId} is missing realm role {config.RequiredRole}.");
+                throw new UnauthorizedAccessException($"Keycloak token for {clientId} is missing realm role {config.RequiredRole}.");
             }
 
             cache[cacheKey] = new CacheEntry { ExpiresAt = DateTimeOffset.UtcNow.AddSeconds(30) };
+        }
+
+        /// <summary>
+        /// The client bound to one workload identity for one repository. The
+        /// subject separator cannot occur in an organisation or repository
+        /// name, so no client id for another route is a prefix of this one.
+        /// </summary>
+        public static string AssertionClientId(string prefix, string organisation, string repository, string subject) =>
+            $"{prefix}{organisation}-{repository}@{subject}";
+
+        private static string SubjectClaim(string jwt)
+        {
+            JsonElement? claims = Claims(jwt);
+            if (claims is null || !claims.Value.TryGetProperty("sub", out JsonElement subject) || subject.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+
+            return subject.GetString();
+        }
+
+        private static JsonElement? Claims(string jwt)
+        {
+            if (string.IsNullOrWhiteSpace(jwt))
+            {
+                return null;
+            }
+
+            string[] parts = jwt.Split('.');
+            if (parts.Length < 2)
+            {
+                return null;
+            }
+
+            try
+            {
+                using JsonDocument payload = JsonDocument.Parse(Base64UrlDecode(parts[1]));
+                return payload.RootElement.Clone();
+            }
+            catch (Exception exception) when (exception is FormatException || exception is JsonException)
+            {
+                return null;
+            }
         }
 
         private static string Hash(string value)
@@ -85,21 +157,9 @@ namespace Estranged.Lfs.Authenticator.Keycloak
 
         private static bool HasRealmRole(string jwt, string role)
         {
-            if (string.IsNullOrWhiteSpace(jwt))
-            {
-                return false;
-            }
-
-            string[] parts = jwt.Split('.');
-            if (parts.Length < 2)
-            {
-                return false;
-            }
-
-            byte[] payloadBytes = Base64UrlDecode(parts[1]);
-            using JsonDocument payload = JsonDocument.Parse(payloadBytes);
-
-            if (!payload.RootElement.TryGetProperty("realm_access", out JsonElement realmAccess) ||
+            JsonElement? claims = Claims(jwt);
+            if (claims is null ||
+                !claims.Value.TryGetProperty("realm_access", out JsonElement realmAccess) ||
                 !realmAccess.TryGetProperty("roles", out JsonElement roles) ||
                 roles.ValueKind != JsonValueKind.Array)
             {

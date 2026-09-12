@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\Estranged.Lfs.Adapter.S3\Estranged.Lfs.Adapter.S3.csproj" />
     <ProjectReference Include="..\..\src\Estranged.Lfs.Authenticator.BitBucket\Estranged.Lfs.Authenticator.BitBucket.csproj" />
     <ProjectReference Include="..\..\src\Estranged.Lfs.Authenticator.GitHub\Estranged.Lfs.Authenticator.GitHub.csproj" />
+    <ProjectReference Include="..\..\src\Estranged.Lfs.Authenticator.Keycloak\Estranged.Lfs.Authenticator.Keycloak.csproj" />
   </ItemGroup>
 
 </Project>
