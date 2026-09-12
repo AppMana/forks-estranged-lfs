@@ -25,6 +25,7 @@ namespace Estranged.Lfs.Tests.Adapter.S3
             mockClient.Setup(x => x.GetObjectMetadataAsync("my-bucket", "prefix/d53de494a038b6a8ede0aea08c38bde00244b155924bf4c463d1de208faecee8", CancellationToken.None))
                       .ReturnsAsync(new GetObjectMetadataResponse{ContentLength = 19961});
 
+            mockClient.Setup(x => x.Config).Returns(new AmazonS3Config { ServiceURL = "https://s3.example" });
             mockClient.Setup(x => x.GetPreSignedURL(It.IsAny<GetPreSignedUrlRequest>()))
                       .Callback<GetPreSignedUrlRequest>(request =>
                       {
@@ -88,6 +89,7 @@ namespace Estranged.Lfs.Tests.Adapter.S3
         {
             var mockClient = mockRepository.Create<IAmazonS3>();
 
+            mockClient.Setup(x => x.Config).Returns(new AmazonS3Config { ServiceURL = "https://s3.example" });
             mockClient.Setup(x => x.GetPreSignedURL(It.IsAny<GetPreSignedUrlRequest>()))
                       .Callback<GetPreSignedUrlRequest>(request =>
                       {
@@ -105,6 +107,21 @@ namespace Estranged.Lfs.Tests.Adapter.S3
             Assert.Null(signedBlob.ErrorCode);
             Assert.Null(signedBlob.ErrorMessage);
             Assert.Equal("https://www.example.com/", signedBlob.Uri.ToString());
+        }
+        [Fact]
+        public void PresignedUrlsFollowThePlainHttpEndpointScheme()
+        {
+            var mockClient = mockRepository.Create<IAmazonS3>();
+            mockClient.Setup(x => x.Config).Returns(new AmazonS3Config { ServiceURL = "http://minio.internal:9000" });
+            mockClient.Setup(x => x.GetPreSignedURL(It.IsAny<GetPreSignedUrlRequest>()))
+                      .Callback<GetPreSignedUrlRequest>(request => Assert.Equal(Protocol.HTTP, request.Protocol))
+                      .Returns("http://minio.internal:9000/my-bucket/prefix/oid");
+
+            var adapter = new S3BlobAdapter(mockClient.Object, new S3BlobAdapterConfig { Bucket = "my-bucket", KeyPrefix = "prefix/" });
+
+            Assert.Equal("http://minio.internal:9000/my-bucket/prefix/oid", adapter.MakePreSignedUrl("oid", HttpVerb.PUT, "application/octet-stream").ToString());
+            Assert.Equal(Protocol.HTTPS, S3BlobAdapter.ProtocolFor(null));
+            Assert.Equal(Protocol.HTTPS, S3BlobAdapter.ProtocolFor("https://s3.amazonaws.com"));
         }
     }
 }

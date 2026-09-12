@@ -19,6 +19,13 @@ namespace Estranged.Lfs.Adapter.S3
             this.config = config;
         }
 
+        /// <summary>
+        /// Presigned URLs must carry the scheme of the endpoint they are signed
+        /// for; a plain-HTTP object store rejects an HTTPS presign outright.
+        /// </summary>
+        public static Protocol ProtocolFor(string serviceUrl) =>
+            serviceUrl != null && serviceUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ? Protocol.HTTP : Protocol.HTTPS;
+
         public Uri MakePreSignedUrl(string oid, HttpVerb verb, string mimeType)
         {
             var request = new GetPreSignedUrlRequest
@@ -26,7 +33,7 @@ namespace Estranged.Lfs.Adapter.S3
                 Verb = verb,
                 BucketName = config.Bucket,
                 Key = config.KeyPrefix + oid,
-                Protocol = Protocol.HTTPS,
+                Protocol = ProtocolFor(client.Config?.ServiceURL),
                 ContentType = mimeType,
                 Expires = DateTime.UtcNow + config.Expiry
             };
