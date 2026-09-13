@@ -16,11 +16,13 @@ namespace Estranged.Lfs.Adapter.S3
 
         private readonly IAmazonS3 client;
         private readonly IS3BlobAdapterConfig config;
+        private readonly bool requireSha256;
 
-        public S3BlobAdapter(IAmazonS3 client, IS3BlobAdapterConfig config)
+        public S3BlobAdapter(IAmazonS3 client, IS3BlobAdapterConfig config, bool requireSha256 = false)
         {
             this.client = client;
             this.config = config;
+            this.requireSha256 = requireSha256;
         }
 
         /// <summary>
@@ -42,6 +44,8 @@ namespace Estranged.Lfs.Adapter.S3
                 Expires = DateTime.UtcNow + config.Expiry
             };
 
+            if (requireSha256 && verb == HttpVerb.PUT)
+                request.Headers["x-amz-checksum-sha256"] = Convert.ToBase64String(Convert.FromHexString(oid));
             return new Uri(client.GetPreSignedURL(request));
         }
 
@@ -71,14 +75,13 @@ namespace Estranged.Lfs.Adapter.S3
 
         public Task<SignedBlob> UriForUpload(string oid, long size, CancellationToken token)
         {
+            var headers = new Dictionary<string, string> { { "Content-Type", BlobConstants.UploadMimeType } };
+            if (requireSha256) headers["x-amz-checksum-sha256"] = Convert.ToBase64String(Convert.FromHexString(oid));
             return Task.FromResult(new SignedBlob
             {
                 Uri = MakePreSignedUrl(oid, HttpVerb.PUT, BlobConstants.UploadMimeType),
                 Expiry = config.Expiry,
-                Headers = new Dictionary<string, string>
-                {
-                    {"Content-Type", BlobConstants.UploadMimeType}
-                }
+                Headers = headers
             });
         }
     }

@@ -80,7 +80,7 @@ namespace Estranged.Lfs.Adapter.S3
                     Bucket = bucket,
                     KeyPrefix = grant.StoragePrefix,
                     Expiry = lifetime < TimeSpan.FromMinutes(5) ? lifetime : TimeSpan.FromMinutes(5),
-                });
+                }, requireSha256: true);
                 return adapter;
             }
             finally { mutex.Release(); }

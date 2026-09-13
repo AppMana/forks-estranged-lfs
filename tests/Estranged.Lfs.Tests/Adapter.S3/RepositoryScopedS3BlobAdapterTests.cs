@@ -48,6 +48,11 @@ namespace Estranged.Lfs.Tests.Adapter.S3
             Assert.Equal("AWS4-HMAC-SHA256", query["X-Amz-Algorithm"]);
             Assert.Equal("scoped-session", query["X-Amz-Security-Token"]);
             Assert.StartsWith("scoped-key/", query["X-Amz-Credential"]);
+            var checksum = Convert.ToBase64String(Convert.FromHexString(Oid));
+            Assert.Equal(checksum, signed.Headers["x-amz-checksum-sha256"]);
+            // The checksum must be authenticated, whether the SDK signs it as
+            // a header or hoists it into the canonical query string.
+            Assert.True(query["X-Amz-SignedHeaders"]?.Contains("x-amz-checksum-sha256") == true || query["x-amz-checksum-sha256"] == checksum);
             Assert.Null(query["AWSAccessKeyId"]); // SigV2 cannot resolve STS credentials.
             Assert.InRange(int.Parse(query["X-Amz-Expires"]), 1, 240);
             Assert.True(signed.Expiry < TimeSpan.FromMinutes(4));
