@@ -106,7 +106,7 @@ public sealed class FederatedIdentityVerifier : IIdentityVerifier
             var handler = new HttpClientHandler { AllowAutoRedirect = false };
             if (definition.CaFile != null)
             {
-                var root = X509Certificate2.CreateFromPemFile(definition.CaFile);
+                var root = X509Certificate2.CreateFromPem(File.ReadAllText(definition.CaFile));
                 handler.ServerCertificateCustomValidationCallback = (_, cert, _, errors) =>
                 {
                     if (cert == null || (errors & SslPolicyErrors.RemoteCertificateNameMismatch) != 0) return false;

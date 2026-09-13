@@ -67,4 +67,19 @@ public sealed class IdentityTests
         Assert.InRange(jwt.ValidTo - DateTime.UtcNow, TimeSpan.FromMinutes(4), TimeSpan.FromMinutes(5));
         Assert.DoesNotContain("private", JsonSerializer.Serialize(issuer.Jwks));
     }
+    [Fact] public void KubernetesTrustAcceptsCertificateOnlyPemWithoutPrivateKey()
+    {
+        using var rsa = RSA.Create(2048);
+        var request = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=test-ca", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddDays(1));
+        var path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllText(path, certificate.ExportCertificatePem());
+            var document = JsonSerializer.Serialize(new[] { new TrustedIssuer("https://kubernetes.default.svc", path) });
+            _ = new FederatedIdentityVerifier(document, "https://lfs.test");
+        }
+        finally { File.Delete(path); }
+    }
+
 }
