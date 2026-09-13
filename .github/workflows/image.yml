@@ -19,7 +19,21 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            9.0.x
+      - name: Legacy and scoped storage tests
+        run: dotnet test tests/Estranged.Lfs.Tests --configuration Release --verbosity minimal
+      - name: PostgreSQL, enrollment and identity tests
+        run: scripts/test-registry.sh
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +52,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/estranged-lfs
           tags: |
             type=sha,format=long
+            type=raw,value=uuid-enrollment-v1
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
 

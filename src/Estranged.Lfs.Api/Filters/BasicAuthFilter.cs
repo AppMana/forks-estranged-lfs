@@ -1,4 +1,4 @@
-﻿using Estranged.Lfs.Data;
+using Estranged.Lfs.Data;
 using Microsoft.AspNetCore.Http;
 using System;
 using System.Linq;
@@ -15,11 +15,13 @@ namespace Estranged.Lfs.Api.Filters
     {
         private readonly ILogger<BasicAuthFilter> logger;
         private readonly IAuthenticator authenticator;
+        private readonly IRepositoryAuthenticator repositoryAuthenticator;
 
-        public BasicAuthFilter(ILogger<BasicAuthFilter> logger, IAuthenticator authenticator)
+        public BasicAuthFilter(ILogger<BasicAuthFilter> logger, IAuthenticator authenticator, System.Collections.Generic.IEnumerable<IRepositoryAuthenticator> repositoryAuthenticators)
         {
             this.logger = logger;
             this.authenticator = authenticator;
+            repositoryAuthenticator = repositoryAuthenticators.SingleOrDefault();
         }
 
         public string AuthorizationHeader => "Authorization";
@@ -68,10 +70,26 @@ namespace Estranged.Lfs.Api.Filters
             return (authPair[0], authPair[1]);
         }
 
-        private LfsPermission GetRequiredPermission(HttpRequest request) => request.Method.ToUpper() == "GET" ? LfsPermission.Read : LfsPermission.Write;
+        private LfsPermission GetRequiredPermission(ActionExecutingContext context) =>
+            context.HttpContext.Request.Method == "GET" ||
+            context.ActionArguments.TryGetValue("request", out var request) && request is Entities.BatchRequest batch && batch.Operation == Entities.LfsOperation.Download
+                ? LfsPermission.Read : LfsPermission.Write;
 
         public async Task OnActionExecutionAsync(ActionExecutingContext context, ActionExecutionDelegate next)
         {
+            if (context.RouteData.Values.TryGetValue("org", out var route) && route?.ToString() == "r")
+            {
+                try
+                {
+                    if (repositoryAuthenticator == null) throw new UnauthorizedAccessException("UUID repository authentication is not configured.");
+                    await repositoryAuthenticator.Authenticate(context.HttpContext.Request.Headers.Authorization.ToString(),
+                        context.RouteData.Values["repo"]?.ToString(), GetRequiredPermission(context), context.HttpContext.RequestAborted);
+                }
+                catch (UnauthorizedAccessException) { Forbidden(context); return; }
+                catch (System.Security.Authentication.AuthenticationException) { Unauthorised(context); return; }
+                await next();
+                return;
+            }
             string username;
             string password;
             try
@@ -89,7 +107,7 @@ namespace Estranged.Lfs.Api.Filters
             {
                 string organisation = context.RouteData.Values.TryGetValue("org", out object org) ? org?.ToString() : null;
                 string repository = context.RouteData.Values.TryGetValue("repo", out object repo) ? repo?.ToString() : null;
-                await authenticator.Authenticate(username, password, organisation, repository, GetRequiredPermission(context.HttpContext.Request), CancellationToken.None).ConfigureAwait(false);
+                await authenticator.Authenticate(username, password, organisation, repository, GetRequiredPermission(context), CancellationToken.None).ConfigureAwait(false);
             }
             catch (UnauthorizedAccessException e)
             {

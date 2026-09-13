@@ -23,6 +23,8 @@ using Estranged.Lfs.Authenticator.BitBucket;
 using Estranged.Lfs.Authenticator.GitHub;
 using Estranged.Lfs.Authenticator.Keycloak;
 using Estranged.Lfs.Data;
+using Estranged.Lfs.Registry;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
@@ -31,13 +33,27 @@ using Microsoft.Extensions.Logging;
 
 // Trace AWS SDK calls so we can see any request/sign mismatches.
 Amazon.AWSConfigs.LoggingConfig.LogTo = Amazon.LoggingOptions.Console;
-Amazon.AWSConfigs.LoggingConfig.LogResponses = Amazon.ResponseLoggingOption.Always;
-Amazon.AWSConfigs.LoggingConfig.LogMetrics = true;
+Amazon.AWSConfigs.LoggingConfig.LogResponses = Amazon.ResponseLoggingOption.Never;
+Amazon.AWSConfigs.LoggingConfig.LogMetrics = false;
 
+if (args.Contains("--migrate"))
+{
+    await using var db = new RepositoryDbContextFactory().CreateDbContext(Array.Empty<string>());
+    await db.Database.MigrateAsync();
+    var importIndex = Array.IndexOf(args, "--import-repositories");
+    if (importIndex >= 0)
+        await RepositoryCatalog.Import(db, RepositoryCatalog.Parse(await File.ReadAllTextAsync(args[importIndex + 1])), default);
+    if (args.Contains("--grant-runtime-role"))
+    {
+        await db.Database.ExecuteSqlRawAsync("GRANT USAGE ON SCHEMA public TO lfs_app; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO lfs_app; GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO lfs_app;");
+    }
+    return;
+}
 var builder = WebApplication.CreateBuilder(args);
-
 // --- env-var configuration (matches the Lambda host's Startup.cs) ---
 var cfg = builder.Configuration;
+bool registryEnabled = !string.IsNullOrWhiteSpace(cfg["LFS_DB_HOST"]) || !string.IsNullOrWhiteSpace(cfg["LFS_DATABASE_URL"]);
+if (registryEnabled) RegistryHosting.Configure(builder.Services, cfg);
 string lfsBucket   = cfg["LFS_BUCKET"];
 string lfsUser     = cfg["LFS_USERNAME"];
 string lfsPass     = cfg["LFS_PASSWORD"];
@@ -137,6 +153,13 @@ if (isS3)
     services.AddScoped<IBlobAdapter>(sp =>
     {
         var http = sp.GetRequiredService<IHttpContextAccessor>().HttpContext;
+        if (http?.Request.RouteValues["org"]?.ToString() == "r")
+        {
+            if (!registryEnabled) throw new InvalidOperationException("UUID repository service is not configured.");
+            return new RepositoryScopedS3BlobAdapter(sp.GetRequiredService<RepositoryGrant>(),
+                http.Request.RouteValues["repo"]?.ToString(), lfsBucket, s3Endpoint, stsEndpoint,
+                sp.GetRequiredService<HttpClient>());
+        }
         string routePrefix = RouteObjectKeyPrefix(http);
         IBlobAdapter primary = new S3BlobAdapter(sp.GetRequiredService<IAmazonS3>(), new S3BlobAdapterConfig { Bucket = lfsBucket, KeyPrefix = routePrefix });
         var fallbacks = new List<IBlobAdapter>();
@@ -165,9 +188,10 @@ services.AddLogging(x => { x.AddConsole(); x.AddDebug(); });
 
 // Health endpoint without auth, plus the LFS controllers.
 var app = builder.Build();
+if (registryEnabled) RegistryHosting.Map(app);
 app.MapGet("/healthz", () => Results.Ok(new { ok = true, mode = isS3 ? "s3" : "azure", bucket = lfsBucket }));
 app.UseRouting();
-app.UseEndpoints(e => e.MapControllers());
+app.MapControllers();
 app.Run();
 
 static string RouteObjectKeyPrefix(HttpContext http)
