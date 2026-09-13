@@ -74,7 +74,7 @@ namespace Estranged.Lfs.Adapter.S3
                 var lifetime = expiry - DateTimeOffset.UtcNow - TimeSpan.FromSeconds(10);
                 if (lifetime <= TimeSpan.Zero) throw new UnauthorizedAccessException("Storage credentials already expired.");
                 client = new AmazonS3Client(new SessionAWSCredentials(Text("AccessKeyId"), Text("SecretAccessKey"), Text("SessionToken")),
-                    new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true });
+                    new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, SignatureVersion = "4", AuthenticationRegion = "us-east-1" });
                 adapter = new S3BlobAdapter(client, new S3BlobAdapterConfig
                 {
                     Bucket = bucket,

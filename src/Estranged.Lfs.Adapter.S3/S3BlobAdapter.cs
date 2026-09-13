@@ -10,6 +10,10 @@ namespace Estranged.Lfs.Adapter.S3
 {
     public sealed class S3BlobAdapter : IBlobAdapter
     {
+        // The SDK otherwise special-cases us-east-1 presigns to SigV2 even
+        // when the client requests SigV4. STS credentials require SigV4.
+        static S3BlobAdapter() => Amazon.AWSConfigsS3.UseSignatureVersion4 = true;
+
         private readonly IAmazonS3 client;
         private readonly IS3BlobAdapterConfig config;
 

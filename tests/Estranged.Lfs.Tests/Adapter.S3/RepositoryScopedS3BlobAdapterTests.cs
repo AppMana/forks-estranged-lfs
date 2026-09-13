@@ -44,7 +44,12 @@ namespace Estranged.Lfs.Tests.Adapter.S3
             grant.RepositoryId = Repo; grant.StoragePrefix = "AppMana/lbxx/"; grant.AccessToken = "repository-token";
             var signed = await adapter.UriForUpload(Oid, 123, CancellationToken.None);
             Assert.Equal("/lfs/AppMana/lbxx/" + Oid, signed.Uri.AbsolutePath);
-            Assert.Contains("scoped-session", signed.Uri.Query);
+            var query = HttpUtility.ParseQueryString(signed.Uri.Query);
+            Assert.Equal("AWS4-HMAC-SHA256", query["X-Amz-Algorithm"]);
+            Assert.Equal("scoped-session", query["X-Amz-Security-Token"]);
+            Assert.StartsWith("scoped-key/", query["X-Amz-Credential"]);
+            Assert.Null(query["AWSAccessKeyId"]); // SigV2 cannot resolve STS credentials.
+            Assert.InRange(int.Parse(query["X-Amz-Expires"]), 1, 240);
             Assert.True(signed.Expiry < TimeSpan.FromMinutes(4));
             await adapter.UriForUpload(Oid, 123, CancellationToken.None);
             Assert.Equal(1, handler.Calls);
