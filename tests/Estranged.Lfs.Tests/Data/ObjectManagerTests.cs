@@ -42,6 +42,61 @@ namespace Estranged.Lfs.Tests.Data
         }
 
         [Fact]
+        public async Task DownloadObjectsOverlapsLookupsWithinTheConcurrencyLimit()
+        {
+            var active = 0;
+            var peak = 0;
+            var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
+            blobAdapter
+                .Setup(x => x.UriForDownload(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(async (string oid, CancellationToken _) =>
+                {
+                    var now = Interlocked.Increment(ref active);
+                    int seen;
+                    while (now > (seen = Volatile.Read(ref peak)) && Interlocked.CompareExchange(ref peak, now, seen) != seen) { }
+                    if (now == ObjectManager.MaxConcurrentDownloadLookups) release.TrySetResult();
+                    await release.Task;
+                    Interlocked.Decrement(ref active);
+                    return new SignedBlob { Uri = new Uri($"https://storage.example/{oid}"), Size = 1, Expiry = TimeSpan.FromMinutes(5) };
+                });
+
+            var objects = Enumerable.Range(0, 100).Select(i => new RequestObject { Oid = $"oid-{i}", Size = 1 }).ToList();
+            var response = (await new ObjectManager(blobAdapter.Object).DownloadObjects(objects, CancellationToken.None)).ToList();
+
+            Assert.Equal(ObjectManager.MaxConcurrentDownloadLookups, peak);
+            Assert.Equal(100, response.Count);
+            Assert.All(response, x => Assert.NotNull(x.Actions.Download));
+        }
+
+        [Fact]
+        public async Task DownloadObjectsKeepsRequestOrderWhenLookupsFinishOutOfOrder()
+        {
+            var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
+            blobAdapter
+                .Setup(x => x.UriForDownload(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(async (string oid, CancellationToken _) =>
+                {
+                    await Task.Delay(oid == "first" ? 50 : 0);
+                    return oid == "missing"
+                        ? new SignedBlob { ErrorCode = 404, ErrorMessage = "Object not found" }
+                        : new SignedBlob { Uri = new Uri($"https://storage.example/{oid}"), Size = oid.Length, Expiry = TimeSpan.FromMinutes(5) };
+                });
+
+            var response = (await new ObjectManager(blobAdapter.Object).DownloadObjects(new List<RequestObject>
+            {
+                new RequestObject { Oid = "first", Size = 9 },
+                new RequestObject { Oid = "missing", Size = 9 },
+                new RequestObject { Oid = "last", Size = 9 },
+            }, CancellationToken.None)).ToList();
+
+            Assert.Equal(new[] { "first", "missing", "last" }, response.Select(x => x.Oid));
+            Assert.Equal(new Uri("https://storage.example/first"), response[0].Actions.Download.Href);
+            Assert.Equal(404, response[1].Error.Code);
+            Assert.Equal(4, response[2].Size);
+        }
+
+        [Fact]
         public async Task FallbackBlobAdapterUsesFallbackOnlyForMissingDownloads()
         {
             var primary = new Mock<IBlobAdapter>(MockBehavior.Strict);

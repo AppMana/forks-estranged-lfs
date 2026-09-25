@@ -8,6 +8,8 @@ namespace Estranged.Lfs.Data
 {
     public class ObjectManager : IObjectManager
     {
+        public const int MaxConcurrentDownloadLookups = 16;
+
         private readonly IBlobAdapter blobAdapter;
 
         public ObjectManager(IBlobAdapter blobAdapter)
@@ -40,10 +42,20 @@ namespace Estranged.Lfs.Data
 
         public async Task<IEnumerable<ResponseObject>> DownloadObjects(IList<RequestObject> objects, CancellationToken token)
         {
-            var responseObjects = new List<ResponseObject>();
-            foreach ((RequestObject requestObject, Task<SignedBlob> signedBlobTask) in objects.Select(x => (x, blobAdapter.UriForDownload(x.Oid, token))))
+            // Each download needs a storage metadata round trip. Awaiting them one
+            // at a time made a 100-object batch cost the sum of its latencies and
+            // overrun the controller's 25 second budget; bound the fan-out instead.
+            using var concurrency = new SemaphoreSlim(MaxConcurrentDownloadLookups);
+            var signedBlobs = await Task.WhenAll(objects.Select(async x =>
             {
-                var signedBlob = await signedBlobTask.ConfigureAwait(false);
+                await concurrency.WaitAsync(token).ConfigureAwait(false);
+                try { return await blobAdapter.UriForDownload(x.Oid, token).ConfigureAwait(false); }
+                finally { concurrency.Release(); }
+            })).ConfigureAwait(false);
+
+            var responseObjects = new List<ResponseObject>();
+            foreach ((RequestObject requestObject, SignedBlob signedBlob) in objects.Zip(signedBlobs))
+            {
 
                 if (signedBlob.ErrorCode.HasValue)
                 {
