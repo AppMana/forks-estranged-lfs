@@ -1,4 +1,4 @@
-﻿using Estranged.Lfs.Data.Entities;
+using Estranged.Lfs.Data.Entities;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
@@ -19,24 +19,30 @@ namespace Estranged.Lfs.Data
 
         public async Task<IEnumerable<ResponseObject>> UploadObjects(IList<RequestObject> objects, CancellationToken token)
         {
-            IEnumerable<Task<SignedBlob>> uploadUriTasks = objects.Select(ob => blobAdapter.UriForUpload(ob.Oid, ob.Size, token));
-
-            SignedBlob[] signedBlobs = await Task.WhenAll(uploadUriTasks).ConfigureAwait(false);
+            using var concurrency = new SemaphoreSlim(MaxConcurrentDownloadLookups);
+            SignedBlob[] signedBlobs = await Task.WhenAll(objects.Select(async ob =>
+            {
+                await concurrency.WaitAsync(token).ConfigureAwait(false);
+                try { return await blobAdapter.UriForUpload(ob.Oid, ob.Size, token).ConfigureAwait(false); }
+                finally { concurrency.Release(); }
+            })).ConfigureAwait(false);
 
             return objects.Select((ob, index) => new ResponseObject
             {
                 Oid = ob.Oid,
                 Size = ob.Size,
                 Authenticated = true,
-                Actions = new Actions
-                {
-                    Upload = new Action
+                Actions = signedBlobs[index].AlreadyExists || signedBlobs[index].Uri == null
+                    ? null
+                    : new Actions
                     {
-                        Href = signedBlobs[index].Uri,
-                        ExpiresIn = (long)signedBlobs[index].Expiry.TotalSeconds,
-                        Headers = signedBlobs[index].Headers
+                        Upload = new Action
+                        {
+                            Href = signedBlobs[index].Uri,
+                            ExpiresIn = (long)signedBlobs[index].Expiry.TotalSeconds,
+                            Headers = signedBlobs[index].Headers
+                        }
                     }
-                }
             });
         }
 
@@ -56,7 +62,6 @@ namespace Estranged.Lfs.Data
             var responseObjects = new List<ResponseObject>();
             foreach ((RequestObject requestObject, SignedBlob signedBlob) in objects.Zip(signedBlobs))
             {
-
                 if (signedBlob.ErrorCode.HasValue)
                 {
                     responseObjects.Add(new ResponseObject

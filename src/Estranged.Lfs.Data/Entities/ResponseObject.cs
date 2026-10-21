@@ -1,4 +1,4 @@
-﻿using System.Runtime.Serialization;
+using System.Runtime.Serialization;
 
 namespace Estranged.Lfs.Data.Entities
 {
@@ -11,7 +11,7 @@ namespace Estranged.Lfs.Data.Entities
         public long Size { get; set; }
         [DataMember(Name = "authenticated")]
         public bool? Authenticated { get; set; }
-        [DataMember(Name = "actions")]
+        [DataMember(Name = "actions", EmitDefaultValue = false)]
         public Actions Actions { get; set; } = new Actions();
         [DataMember(Name = "error")]
         public ResponseObjectError Error { get; set; }

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace Estranged.Lfs.Data
@@ -11,5 +11,6 @@ namespace Estranged.Lfs.Data
         public TimeSpan Expiry { get; set; }
         public int? ErrorCode { get; set; }
         public string ErrorMessage { get; set; }
+        public bool AlreadyExists { get; set; }
     }
 }

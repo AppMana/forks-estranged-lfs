@@ -79,6 +79,8 @@ string fallbackAk     = cfg["LFS_FALLBACK_AWS_ACCESS_KEY_ID"];
 string fallbackSk     = cfg["LFS_FALLBACK_AWS_SECRET_ACCESS_KEY"];
 string fallbackEndpoint = cfg["LFS_FALLBACK_AWS_ENDPOINT_URL_S3"];
 string fallbacksJson = cfg["LFS_FALLBACKS_JSON"];
+string sharedKeyPrefix = cfg["LFS_SHARED_KEY_PREFIX"] ?? "objects/";
+bool deduplicateUploads = bool.Parse(cfg["LFS_DEDUPLICATE_UPLOADS"] ?? "true");
 
 bool isS3        = !string.IsNullOrWhiteSpace(lfsBucket);
 bool isAzure     = !string.IsNullOrWhiteSpace(azConn);
@@ -153,15 +155,22 @@ if (isS3)
     services.AddScoped<IBlobAdapter>(sp =>
     {
         var http = sp.GetRequiredService<IHttpContextAccessor>().HttpContext;
+        var rootS3 = sp.GetRequiredService<IAmazonS3>();
         if (http?.Request.RouteValues["org"]?.ToString() == "r")
         {
             if (!registryEnabled) throw new InvalidOperationException("UUID repository service is not configured.");
             return new RepositoryScopedS3BlobAdapter(sp.GetRequiredService<RepositoryGrant>(),
                 http.Request.RouteValues["repo"]?.ToString(), lfsBucket, s3Endpoint, stsEndpoint,
-                sp.GetRequiredService<HttpClient>());
+                sp.GetRequiredService<HttpClient>(), rootS3, sharedKeyPrefix, deduplicateUploads);
         }
         string routePrefix = RouteObjectKeyPrefix(http);
-        IBlobAdapter primary = new S3BlobAdapter(sp.GetRequiredService<IAmazonS3>(), new S3BlobAdapterConfig { Bucket = lfsBucket, KeyPrefix = routePrefix });
+        IBlobAdapter primary = new S3BlobAdapter(rootS3, new S3BlobAdapterConfig
+        {
+            Bucket = lfsBucket,
+            KeyPrefix = routePrefix,
+            SharedKeyPrefix = sharedKeyPrefix,
+            DeduplicateUploads = deduplicateUploads
+        });
         var fallbacks = new List<IBlobAdapter>();
         fallbacks.AddRange(sp.GetService<IEnumerable<FallbackS3>>()?
             .Select(x => new S3BlobAdapter(x.Client, new S3BlobAdapterConfig

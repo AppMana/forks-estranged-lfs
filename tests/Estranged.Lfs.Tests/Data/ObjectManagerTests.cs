@@ -124,5 +124,41 @@ namespace Estranged.Lfs.Tests.Data
             primary.VerifyAll();
             fallback.VerifyAll();
         }
+
+        [Fact]
+        public async Task UploadObjectsOmitsActionsWhenBlobAlreadyExists()
+        {
+            var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
+            blobAdapter
+                .Setup(x => x.UriForUpload("existing-oid", 1024, CancellationToken.None))
+                .ReturnsAsync(new SignedBlob
+                {
+                    AlreadyExists = true,
+                    Size = 1024
+                });
+            blobAdapter
+                .Setup(x => x.UriForUpload("new-oid", 2048, CancellationToken.None))
+                .ReturnsAsync(new SignedBlob
+                {
+                    Uri = new Uri("https://storage.example/new-oid"),
+                    Expiry = TimeSpan.FromMinutes(5)
+                });
+
+            var manager = new ObjectManager(blobAdapter.Object);
+            var response = (await manager.UploadObjects(new List<RequestObject>
+            {
+                new RequestObject { Oid = "existing-oid", Size = 1024 },
+                new RequestObject { Oid = "new-oid", Size = 2048 }
+            }, CancellationToken.None)).ToList();
+
+            Assert.Equal(2, response.Count);
+            Assert.Equal("existing-oid", response[0].Oid);
+            Assert.Null(response[0].Actions);
+            Assert.Null(response[0].Error);
+            Assert.Equal("new-oid", response[1].Oid);
+            Assert.NotNull(response[1].Actions?.Upload);
+            Assert.Equal(new Uri("https://storage.example/new-oid"), response[1].Actions.Upload.Href);
+            blobAdapter.VerifyAll();
+        }
     }
 }

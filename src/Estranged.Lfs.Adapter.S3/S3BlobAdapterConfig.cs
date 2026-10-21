@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace Estranged.Lfs.Adapter.S3
 {
@@ -6,6 +6,8 @@ namespace Estranged.Lfs.Adapter.S3
     {
         public string Bucket { get; set; }
         public string KeyPrefix { get; set; }
+        public string SharedKeyPrefix { get; set; }
+        public bool DeduplicateUploads { get; set; }
         public TimeSpan Expiry { get; set; } = TimeSpan.FromHours(1);
     }
 }

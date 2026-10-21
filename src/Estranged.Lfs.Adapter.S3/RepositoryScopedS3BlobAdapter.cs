@@ -23,12 +23,16 @@ namespace Estranged.Lfs.Adapter.S3
         private readonly string endpoint;
         private readonly string stsEndpoint;
         private readonly HttpClient http;
+        private readonly IAmazonS3 sharedClient;
+        private readonly string sharedKeyPrefix;
+        private readonly bool deduplicateUploads;
         private readonly SemaphoreSlim mutex = new(1, 1);
         private IAmazonS3 client;
         private S3BlobAdapter adapter;
 
         public RepositoryScopedS3BlobAdapter(RepositoryGrant grant, string repositoryId,
-            string bucket, string endpoint, string stsEndpoint, HttpClient http)
+            string bucket, string endpoint, string stsEndpoint, HttpClient http,
+            IAmazonS3 sharedClient = null, string sharedKeyPrefix = null, bool deduplicateUploads = false)
         {
             this.grant = grant;
             this.repositoryId = repositoryId;
@@ -36,6 +40,9 @@ namespace Estranged.Lfs.Adapter.S3
             this.endpoint = endpoint;
             this.stsEndpoint = stsEndpoint;
             this.http = http;
+            this.sharedClient = sharedClient;
+            this.sharedKeyPrefix = sharedKeyPrefix;
+            this.deduplicateUploads = deduplicateUploads;
         }
 
         private static void ValidateOid(string oid)
@@ -79,8 +86,10 @@ namespace Estranged.Lfs.Adapter.S3
                 {
                     Bucket = bucket,
                     KeyPrefix = grant.StoragePrefix,
+                    SharedKeyPrefix = sharedKeyPrefix,
+                    DeduplicateUploads = deduplicateUploads,
                     Expiry = lifetime < TimeSpan.FromMinutes(5) ? lifetime : TimeSpan.FromMinutes(5),
-                }, requireSha256: true);
+                }, requireSha256: true, sharedClient: sharedClient);
                 return adapter;
             }
             finally { mutex.Release(); }
