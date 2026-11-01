@@ -50,6 +50,7 @@ if (args.Contains("--migrate"))
     return;
 }
 var builder = WebApplication.CreateBuilder(args);
+LoggingSetup.Configure(builder.Logging);
 // --- env-var configuration (matches the Lambda host's Startup.cs) ---
 var cfg = builder.Configuration;
 bool registryEnabled = !string.IsNullOrWhiteSpace(cfg["LFS_DB_HOST"]) || !string.IsNullOrWhiteSpace(cfg["LFS_DATABASE_URL"]);
@@ -193,7 +194,6 @@ else if (isAzure)
 else throw new InvalidOperationException("Set LFS_BUCKET (S3) or LFS_AZUREBLOB_CONNECTIONSTRING (Azure).");
 
 services.AddLfsApi();
-services.AddLogging(x => { x.AddConsole(); x.AddDebug(); });
 
 // Health endpoint without auth, plus the LFS controllers.
 var app = builder.Build();

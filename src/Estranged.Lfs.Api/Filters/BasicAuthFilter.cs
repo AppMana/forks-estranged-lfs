@@ -90,15 +90,23 @@ namespace Estranged.Lfs.Api.Filters
                 await next();
                 return;
             }
+            if (!context.HttpContext.Request.Headers.ContainsKey(AuthorizationHeader))
+            {
+                // Git LFS sends credentials only after this 401 challenge.
+                logger.LogDebug("Request has no Authorization header; challenging");
+                Unauthorised(context);
+                return;
+            }
+
             string username;
             string password;
             try
             {
                 (username, password) = GetCredentials(context.HttpContext.Request.Headers);
             }
-            catch (Exception e)
+            catch (Exception e) when (e is InvalidOperationException || e is FormatException)
             {
-                logger.LogError(e, $"Error getting Basic credentials");
+                logger.LogWarning("Rejected malformed Basic credentials: {Reason}", e.Message);
                 Unauthorised(context);
                 return;
             }
