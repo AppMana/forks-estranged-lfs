@@ -17,7 +17,7 @@ namespace Estranged.Lfs.Tests.Data
         {
             var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
             blobAdapter
-                .Setup(x => x.UriForDownload("missing-oid", CancellationToken.None))
+                .Setup(x => x.UriForDownload("missing-oid", It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new SignedBlob
                 {
                     ErrorCode = 404,
@@ -130,14 +130,14 @@ namespace Estranged.Lfs.Tests.Data
         {
             var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
             blobAdapter
-                .Setup(x => x.UriForUpload("existing-oid", 1024, CancellationToken.None))
+                .Setup(x => x.UriForUpload("existing-oid", 1024, It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new SignedBlob
                 {
                     AlreadyExists = true,
                     Size = 1024
                 });
             blobAdapter
-                .Setup(x => x.UriForUpload("new-oid", 2048, CancellationToken.None))
+                .Setup(x => x.UriForUpload("new-oid", 2048, It.IsAny<CancellationToken>()))
                 .ReturnsAsync(new SignedBlob
                 {
                     Uri = new Uri("https://storage.example/new-oid"),
@@ -159,6 +159,51 @@ namespace Estranged.Lfs.Tests.Data
             Assert.NotNull(response[1].Actions?.Upload);
             Assert.Equal(new Uri("https://storage.example/new-oid"), response[1].Actions.Upload.Href);
             blobAdapter.VerifyAll();
+        }
+    
+        [Fact]
+        public async Task InvalidObjectsAreDefinitivePerObjectErrors()
+        {
+            var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
+            blobAdapter.Setup(x => x.UriForDownload("bad", It.IsAny<CancellationToken>())).ThrowsAsync(new ArgumentException("LFS OID must be a lowercase SHA-256 digest.", "oid"));
+            blobAdapter.Setup(x => x.UriForDownload("good", It.IsAny<CancellationToken>())).ReturnsAsync(new SignedBlob { Uri = new Uri("https://storage.example/good"), Size = 3 });
+            blobAdapter.Setup(x => x.UriForUpload("bad", 1, It.IsAny<CancellationToken>())).ThrowsAsync(new ArgumentOutOfRangeException("size"));
+            blobAdapter.Setup(x => x.UriForUpload("good", 1, It.IsAny<CancellationToken>())).ReturnsAsync(new SignedBlob { Uri = new Uri("https://storage.example/good") });
+            var manager = new ObjectManager(blobAdapter.Object);
+            var objects = new List<RequestObject> { new RequestObject { Oid = "bad", Size = 1 }, new RequestObject { Oid = "good", Size = 1 } };
+
+            var downloads = (await manager.DownloadObjects(objects, CancellationToken.None)).ToList();
+            var uploads = (await manager.UploadObjects(objects, CancellationToken.None)).ToList();
+
+            Assert.Equal(422, downloads[0].Error.Code);
+            Assert.Null(downloads[1].Error);
+            Assert.Equal(422, uploads[0].Error.Code);
+            Assert.Null(uploads[0].Actions);
+            Assert.NotNull(uploads[1].Actions.Upload);
+        }
+
+        [Fact]
+        public async Task ATransientFailureFailsTheWholeBatchAndStopsTheRemainingLookups()
+        {
+            var failure = new TransientUpstreamException("object storage", new System.Net.Http.HttpRequestException());
+            var cancelled = 0;
+            var blobAdapter = new Mock<IBlobAdapter>(MockBehavior.Strict);
+            blobAdapter
+                .Setup(x => x.UriForDownload(It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .Returns(async (string oid, CancellationToken token) =>
+                {
+                    if (oid == "oid-5") throw failure;
+                    try { await Task.Delay(Timeout.Infinite, token); }
+                    catch (OperationCanceledException) { Interlocked.Increment(ref cancelled); throw; }
+                    return new SignedBlob();
+                });
+            var objects = Enumerable.Range(0, 10).Select(i => new RequestObject { Oid = $"oid-{i}", Size = 1 }).ToList();
+
+            var thrown = await Assert.ThrowsAsync<TransientUpstreamException>(() =>
+                new ObjectManager(blobAdapter.Object).DownloadObjects(objects, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10)));
+
+            Assert.Same(failure, thrown);
+            Assert.True(cancelled > 0);
         }
     }
 }

@@ -21,13 +21,13 @@ namespace Estranged.Lfs.Api
         /// 5xx except 501, 507 and 509 fails the batch, and per-object errors
         /// are never retried, so transient conditions are reported this way.
         /// </summary>
-        public static IActionResult RetryLater(HttpContext http, LfsBatchOptions options, string message)
+        public static ObjectResult RetryLater(HttpContext http, LfsBatchOptions options, string message)
         {
             http.Response.Headers.RetryAfter = ((int)Math.Ceiling(options.RetryAfter.TotalSeconds)).ToString(CultureInfo.InvariantCulture);
             return Error(StatusCodes.Status429TooManyRequests, message);
         }
 
-        public static IActionResult Error(int status, string message) =>
+        public static ObjectResult Error(int status, string message) =>
             new ObjectResult(new { message }) { StatusCode = status };
     }
 }
