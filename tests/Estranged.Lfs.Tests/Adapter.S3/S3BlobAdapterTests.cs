@@ -252,6 +252,21 @@ namespace Estranged.Lfs.Tests.Adapter.S3
         }
 
         [Fact]
+        public async Task UnreachableStorageIsReportedWellInsideTheBatchBudget()
+        {
+            // The SDK's own retries back off 0.4 s, 1.6 s, 6.4 s and 25.6 s by
+            // default, so one metadata call alone could outlast the 25 s budget.
+            using var client = new AmazonS3Client(new BasicAWSCredentials("key", "secret"),
+                S3ClientDefaults.Apply(new AmazonS3Config { ServiceURL = "http://127.0.0.1:1", ForcePathStyle = true }));
+            var adapter = new S3BlobAdapter(client, RepoA());
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+
+            await Assert.ThrowsAsync<TransientUpstreamException>(() => adapter.UriForDownload(Oid, CancellationToken.None));
+
+            Assert.InRange(elapsed.Elapsed, TimeSpan.Zero, TimeSpan.FromSeconds(12));
+        }
+
+        [Fact]
         public async Task DefinitiveStorageAnswersStayObjectErrorsWithoutRetry()
         {
             var mockClient = mockRepository.Create<IAmazonS3>();

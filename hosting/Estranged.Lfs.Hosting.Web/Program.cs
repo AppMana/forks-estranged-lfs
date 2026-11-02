@@ -99,7 +99,7 @@ var services = builder.Services;
 
 static AmazonS3Client CreateS3Client(string endpoint, string region, string accessKey, string secretKey, bool accelerate, string stsEndpoint = null, string roleArn = null, string roleSessionName = null, string webIdentityTokenFile = null)
 {
-    var s3Config = new AmazonS3Config { UseAccelerateEndpoint = accelerate };
+    var s3Config = S3ClientDefaults.Apply(new AmazonS3Config { UseAccelerateEndpoint = accelerate });
     if (!string.IsNullOrWhiteSpace(region))
         s3Config.RegionEndpoint = RegionEndpoint.GetBySystemName(region);
     if (!string.IsNullOrWhiteSpace(endpoint))
