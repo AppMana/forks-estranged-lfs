@@ -9,5 +9,6 @@ namespace Estranged.Lfs.Adapter.S3
         string SharedKeyPrefix { get; }
         bool DeduplicateUploads { get; }
         TimeSpan Expiry { get; }
+        TimeSpan DeduplicationTimeout { get; }
     }
 }

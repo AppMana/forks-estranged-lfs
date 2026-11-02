@@ -130,6 +130,7 @@ if (isS3)
     string awsSk = cfg["AWS_SECRET_ACCESS_KEY"];
     AmazonS3Client s3Client = CreateS3Client(s3Endpoint, awsRegion, awsAk, awsSk, s3Accel, stsEndpoint, roleArn, roleSessionName, webIdentityTokenFile);
     services.AddSingleton<IAmazonS3>(s3Client);
+    services.AddSingleton<ISharedObjectPopulator>(sp => new SharedObjectPopulator(s3Client, sp.GetRequiredService<ILogger<SharedObjectPopulator>>()));
     if (!string.IsNullOrWhiteSpace(fallbackBucket) &&
         !string.IsNullOrWhiteSpace(fallbackAk) &&
         !string.IsNullOrWhiteSpace(fallbackSk))
@@ -156,12 +157,13 @@ if (isS3)
     {
         var http = sp.GetRequiredService<IHttpContextAccessor>().HttpContext;
         var rootS3 = sp.GetRequiredService<IAmazonS3>();
+        var populator = sp.GetRequiredService<ISharedObjectPopulator>();
         if (http?.Request.RouteValues["org"]?.ToString() == "r")
         {
             if (!registryEnabled) throw new InvalidOperationException("UUID repository service is not configured.");
             return new RepositoryScopedS3BlobAdapter(sp.GetRequiredService<RepositoryGrant>(),
                 http.Request.RouteValues["repo"]?.ToString(), lfsBucket, s3Endpoint, stsEndpoint,
-                sp.GetRequiredService<HttpClient>(), rootS3, sharedKeyPrefix, deduplicateUploads);
+                sp.GetRequiredService<HttpClient>(), rootS3, sharedKeyPrefix, deduplicateUploads, populator);
         }
         string routePrefix = RouteObjectKeyPrefix(http);
         IBlobAdapter primary = new S3BlobAdapter(rootS3, new S3BlobAdapterConfig
@@ -170,7 +172,7 @@ if (isS3)
             KeyPrefix = routePrefix,
             SharedKeyPrefix = sharedKeyPrefix,
             DeduplicateUploads = deduplicateUploads
-        });
+        }, populator: populator);
         var fallbacks = new List<IBlobAdapter>();
         fallbacks.AddRange(sp.GetService<IEnumerable<FallbackS3>>()?
             .Select(x => new S3BlobAdapter(x.Client, new S3BlobAdapterConfig
