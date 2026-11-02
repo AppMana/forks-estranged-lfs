@@ -78,6 +78,24 @@ public sealed class LoggingTests
     }
 
     [Fact]
+    public void AwsSdkNotFoundAnswersToExistenceChecksAreNotErrors()
+    {
+        var provider = new RecordingProvider();
+        using var factory = LoggerFactory.Create(builder => builder.AddProvider(provider).SetMinimumLevel(LogLevel.Trace));
+        AwsSdkLogging.Configure().Attach(factory);
+        var sdk = Amazon.Runtime.Internal.Util.Logger.GetLogger(typeof(Amazon.S3.AmazonS3Client));
+        sdk.Error(new Amazon.S3.AmazonS3Exception("Not found", Amazon.Runtime.ErrorType.Sender, "NotFound", "request", System.Net.HttpStatusCode.NotFound),
+            "AmazonS3Exception making request GetObjectMetadataRequest. Attempt 1.");
+        var unavailable = new Amazon.S3.AmazonS3Exception("Slow down", Amazon.Runtime.ErrorType.Receiver, "SlowDown", "request", System.Net.HttpStatusCode.ServiceUnavailable);
+        sdk.Error(unavailable, "AmazonS3Exception making request GetObjectMetadataRequest. Attempt 1.");
+        lock (provider.Entries)
+        {
+            var entry = Assert.Single(provider.Entries);
+            Assert.Same(unavailable, entry.Exception);
+        }
+    }
+
+    [Fact]
     public async Task MissingAuthorizationIsTheLfsChallengeNotAnError()
     {
         var logger = new RecordingLogger<BasicAuthFilter>();

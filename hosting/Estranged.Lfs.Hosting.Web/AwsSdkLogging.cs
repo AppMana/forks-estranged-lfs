@@ -1,13 +1,15 @@
 using System;
 using System.Diagnostics;
 using System.Linq;
+using System.Net;
 using System.Text;
 using Microsoft.Extensions.Logging;
 
 // The SDK's console logger writes every level, including a DEBUG line per
 // request from RegionFinder and AWSSDKUtils. Route it through
 // System.Diagnostics instead, admit warnings and errors only, and forward
-// them to the application's JSON log under the "Amazon" category.
+// them to the application's JSON log under the "Amazon" category. Not
+// found responses are answers to existence checks, not errors.
 public static class AwsSdkLogging
 {
     public const string Category = "Amazon";
@@ -39,10 +41,19 @@ public static class AwsSdkLogging
         bool Admits(TraceEventCache eventCache, string source, TraceEventType eventType, int id) =>
             Filter == null || Filter.ShouldTrace(eventCache, source, eventType, id, null, null, null, null);
 
+        // The SDK logs every error response at error level, including the 404
+        // that answers each existence check the storage adapters make.
+        static bool IsNotFoundAnswer(Exception exception) => exception switch
+        {
+            Amazon.Runtime.AmazonServiceException service => service.StatusCode == HttpStatusCode.NotFound,
+            Amazon.Runtime.Internal.HttpErrorResponseException response => response.Response?.StatusCode == HttpStatusCode.NotFound,
+            _ => false,
+        };
+
         void Forward(TraceEventType eventType, string message, Exception exception)
         {
             var target = logger;
-            if (target == null) return;
+            if (target == null || IsNotFoundAnswer(exception)) return;
             target.Log(LevelOf(eventType), exception, "{AwsSdkMessage}", message);
         }
 
