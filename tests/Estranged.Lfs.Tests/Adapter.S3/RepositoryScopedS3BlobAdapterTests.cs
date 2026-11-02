@@ -1,6 +1,7 @@
 using Estranged.Lfs.Adapter.S3;
 using Estranged.Lfs.Data;
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
@@ -18,19 +19,27 @@ namespace Estranged.Lfs.Tests.Adapter.S3
         {
             public int Calls;
             public HttpStatusCode Status = HttpStatusCode.OK;
+            public readonly Queue<object> Script = new();
             protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
             {
                 Calls++;
+                var status = Status;
+                if (Script.TryDequeue(out var step))
+                {
+                    if (step is Exception failure) throw failure;
+                    status = (HttpStatusCode)step;
+                }
                 Assert.Equal("http://sts.example/", request.RequestUri.ToString());
                 var form = HttpUtility.ParseQueryString(await request.Content.ReadAsStringAsync(token));
                 Assert.Equal("repository-token", form["WebIdentityToken"]);
                 Assert.Equal("arn:aws:iam:::role/sts-claim-based", form["RoleArn"]);
-                return new HttpResponseMessage(Status) { Content = new StringContent(
+                return new HttpResponseMessage(status) { Content = new StringContent(
                     "<Response><Credentials><AccessKeyId>scoped-key</AccessKeyId><SecretAccessKey>scoped-secret</SecretAccessKey>" +
                     "<SessionToken>scoped-session</SessionToken><Expiration>" + DateTimeOffset.UtcNow.AddMinutes(4).ToString("O") +
                     "</Expiration></Credentials></Response>") };
             }
         }
+        static readonly TransientRetryPolicy Fast = new() { MaxAttempts = 3, InitialDelay = TimeSpan.Zero, MaxDelay = TimeSpan.Zero };
         static RepositoryGrant Grant() => new() { RepositoryId = Repo, StoragePrefix = "AppMana/lbxx/", AccessToken = "repository-token" };
 
         [Fact]
@@ -71,6 +80,41 @@ namespace Estranged.Lfs.Tests.Adapter.S3
             handler.Status = HttpStatusCode.Forbidden;
             using var denied = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http);
             await Assert.ThrowsAsync<UnauthorizedAccessException>(() => denied.UriForUpload(Oid, 1, CancellationToken.None));
+        }
+
+        [Fact]
+        public async Task TransientStsFailuresAreRetried()
+        {
+            var handler = new StsHandler();
+            handler.Script.Enqueue(HttpStatusCode.ServiceUnavailable);
+            handler.Script.Enqueue(new HttpRequestException("Connection reset"));
+            using var http = new HttpClient(handler);
+            using var adapter = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http, retryPolicy: Fast);
+            var signed = await adapter.UriForUpload(Oid, 1, CancellationToken.None);
+            Assert.Equal("/lfs/AppMana/lbxx/" + Oid, signed.Uri.AbsolutePath);
+            Assert.Equal(3, handler.Calls);
+        }
+
+        [Fact]
+        public async Task ExhaustedStsFailuresAskTheClientToRetryAndAreNotRepeatedPerObject()
+        {
+            var handler = new StsHandler { Status = HttpStatusCode.BadGateway };
+            using var http = new HttpClient(handler);
+            using var adapter = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http, retryPolicy: Fast);
+            await Assert.ThrowsAsync<TransientUpstreamException>(() => adapter.UriForDownload(Oid, CancellationToken.None));
+            await Assert.ThrowsAsync<TransientUpstreamException>(() => adapter.UriForDownload(Oid, CancellationToken.None));
+            Assert.Equal(3, handler.Calls);
+        }
+
+        [Fact]
+        public async Task RejectedStsExchangeIsNotRetriedOrRepeated()
+        {
+            var handler = new StsHandler { Status = HttpStatusCode.Forbidden };
+            using var http = new HttpClient(handler);
+            using var adapter = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http, retryPolicy: Fast);
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() => adapter.UriForUpload(Oid, 1, CancellationToken.None));
+            await Assert.ThrowsAsync<UnauthorizedAccessException>(() => adapter.UriForUpload(Oid, 1, CancellationToken.None));
+            Assert.Equal(1, handler.Calls);
         }
 
         [Theory]

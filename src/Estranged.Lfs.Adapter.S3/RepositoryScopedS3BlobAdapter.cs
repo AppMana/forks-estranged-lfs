@@ -6,6 +6,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
@@ -27,6 +28,8 @@ namespace Estranged.Lfs.Adapter.S3
         private readonly string sharedKeyPrefix;
         private readonly bool deduplicateUploads;
         private readonly ISharedObjectPopulator populator;
+        private readonly TransientRetryPolicy retryPolicy;
+        private ExceptionDispatchInfo exchangeFailure;
         private readonly SemaphoreSlim mutex = new(1, 1);
         private IAmazonS3 client;
         private S3BlobAdapter adapter;
@@ -34,7 +37,7 @@ namespace Estranged.Lfs.Adapter.S3
         public RepositoryScopedS3BlobAdapter(RepositoryGrant grant, string repositoryId,
             string bucket, string endpoint, string stsEndpoint, HttpClient http,
             IAmazonS3 sharedClient = null, string sharedKeyPrefix = null, bool deduplicateUploads = false,
-            ISharedObjectPopulator populator = null)
+            ISharedObjectPopulator populator = null, TransientRetryPolicy retryPolicy = null)
         {
             this.grant = grant;
             this.repositoryId = repositoryId;
@@ -46,6 +49,7 @@ namespace Estranged.Lfs.Adapter.S3
             this.sharedKeyPrefix = sharedKeyPrefix;
             this.deduplicateUploads = deduplicateUploads;
             this.populator = populator;
+            this.retryPolicy = retryPolicy ?? DefaultRetryPolicy;
         }
 
         private static void ValidateOid(string oid)
@@ -54,46 +58,78 @@ namespace Estranged.Lfs.Adapter.S3
                 throw new ArgumentException("LFS OID must be a lowercase SHA-256 digest.", nameof(oid));
         }
 
+        public static readonly TransientRetryPolicy DefaultRetryPolicy = new()
+        {
+            MaxAttempts = 3,
+            InitialDelay = TimeSpan.FromMilliseconds(200),
+            MaxDelay = TimeSpan.FromSeconds(1),
+            AttemptTimeout = TimeSpan.FromSeconds(5)
+        };
+
+        private sealed record StorageCredentials(string AccessKeyId, string SecretAccessKey, string SessionToken, DateTimeOffset Expiration);
+
+        private async Task<StorageCredentials> ExchangeAsync(CancellationToken token)
+        {
+            using var form = new FormUrlEncodedContent(new Dictionary<string, string>
+            {
+                ["Action"] = "AssumeRoleWithWebIdentity",
+                ["Version"] = "2011-06-15",
+                ["RoleArn"] = "arn:aws:iam:::role/sts-claim-based",
+                ["RoleSessionName"] = "lfs-" + repositoryId,
+                ["WebIdentityToken"] = grant.AccessToken,
+                ["DurationSeconds"] = "900",
+            });
+            using var response = await http.PostAsync(stsEndpoint, form, token).ConfigureAwait(false);
+            int status = (int)response.StatusCode;
+            if (TransientRetry.IsTransientStatus(status))
+                throw new HttpRequestException($"Repository storage exchange failed ({status}).", null, response.StatusCode);
+            if (!response.IsSuccessStatusCode)
+                throw new UnauthorizedAccessException($"Repository storage exchange failed ({status}).");
+            var document = XDocument.Parse(await response.Content.ReadAsStringAsync(token).ConfigureAwait(false));
+            string Text(string name) => document.Descendants().Single(x => x.Name.LocalName == name).Value;
+            return new StorageCredentials(Text("AccessKeyId"), Text("SecretAccessKey"), Text("SessionToken"),
+                DateTimeOffset.Parse(Text("Expiration"), CultureInfo.InvariantCulture));
+        }
+
         private async Task<S3BlobAdapter> Adapter(CancellationToken token)
         {
             await mutex.WaitAsync(token).ConfigureAwait(false);
             try
             {
                 if (adapter != null) return adapter;
-                if (!RepositoryGrant.IsRepositoryId(repositoryId) || grant.RepositoryId != repositoryId ||
-                    !RepositoryGrant.IsStoragePrefix(grant.StoragePrefix) || string.IsNullOrWhiteSpace(grant.AccessToken))
-                    throw new UnauthorizedAccessException("No authenticated grant for this repository.");
-                if (string.IsNullOrWhiteSpace(stsEndpoint) || string.IsNullOrWhiteSpace(endpoint))
-                    throw new InvalidOperationException("Repository storage requires S3 and STS endpoints.");
+                // A batch asks for every object through this adapter; once the
+                // exchange has failed definitively or exhausted its retries, the
+                // remaining objects share that outcome instead of repeating it.
+                exchangeFailure?.Throw();
+                try
+                {
+                    if (!RepositoryGrant.IsRepositoryId(repositoryId) || grant.RepositoryId != repositoryId ||
+                        !RepositoryGrant.IsStoragePrefix(grant.StoragePrefix) || string.IsNullOrWhiteSpace(grant.AccessToken))
+                        throw new UnauthorizedAccessException("No authenticated grant for this repository.");
+                    if (string.IsNullOrWhiteSpace(stsEndpoint) || string.IsNullOrWhiteSpace(endpoint))
+                        throw new InvalidOperationException("Repository storage requires S3 and STS endpoints.");
 
-                using var form = new FormUrlEncodedContent(new Dictionary<string, string>
+                    var credentials = await TransientRetry.ExecuteAsync("repository storage STS", retryPolicy,
+                        TransientRetry.IsTransientNetworkFailure, ExchangeAsync, token).ConfigureAwait(false);
+                    var lifetime = credentials.Expiration - DateTimeOffset.UtcNow - TimeSpan.FromSeconds(10);
+                    if (lifetime <= TimeSpan.Zero) throw new UnauthorizedAccessException("Storage credentials already expired.");
+                    client = new AmazonS3Client(new SessionAWSCredentials(credentials.AccessKeyId, credentials.SecretAccessKey, credentials.SessionToken),
+                        new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, SignatureVersion = "4", AuthenticationRegion = "us-east-1" });
+                    adapter = new S3BlobAdapter(client, new S3BlobAdapterConfig
+                    {
+                        Bucket = bucket,
+                        KeyPrefix = grant.StoragePrefix,
+                        SharedKeyPrefix = sharedKeyPrefix,
+                        DeduplicateUploads = deduplicateUploads,
+                        Expiry = lifetime < TimeSpan.FromMinutes(5) ? lifetime : TimeSpan.FromMinutes(5),
+                    }, requireSha256: true, sharedClient: sharedClient, populator: populator);
+                    return adapter;
+                }
+                catch (Exception exception) when (exception is UnauthorizedAccessException || exception is TransientUpstreamException)
                 {
-                    ["Action"] = "AssumeRoleWithWebIdentity",
-                    ["Version"] = "2011-06-15",
-                    ["RoleArn"] = "arn:aws:iam:::role/sts-claim-based",
-                    ["RoleSessionName"] = "lfs-" + repositoryId,
-                    ["WebIdentityToken"] = grant.AccessToken,
-                    ["DurationSeconds"] = "900",
-                });
-                using var response = await http.PostAsync(stsEndpoint, form, token).ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode)
-                    throw new UnauthorizedAccessException($"Repository storage exchange failed ({(int)response.StatusCode}).");
-                var document = XDocument.Parse(await response.Content.ReadAsStringAsync(token).ConfigureAwait(false));
-                string Text(string name) => document.Descendants().Single(x => x.Name.LocalName == name).Value;
-                var expiry = DateTimeOffset.Parse(Text("Expiration"), CultureInfo.InvariantCulture);
-                var lifetime = expiry - DateTimeOffset.UtcNow - TimeSpan.FromSeconds(10);
-                if (lifetime <= TimeSpan.Zero) throw new UnauthorizedAccessException("Storage credentials already expired.");
-                client = new AmazonS3Client(new SessionAWSCredentials(Text("AccessKeyId"), Text("SecretAccessKey"), Text("SessionToken")),
-                    new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, SignatureVersion = "4", AuthenticationRegion = "us-east-1" });
-                adapter = new S3BlobAdapter(client, new S3BlobAdapterConfig
-                {
-                    Bucket = bucket,
-                    KeyPrefix = grant.StoragePrefix,
-                    SharedKeyPrefix = sharedKeyPrefix,
-                    DeduplicateUploads = deduplicateUploads,
-                    Expiry = lifetime < TimeSpan.FromMinutes(5) ? lifetime : TimeSpan.FromMinutes(5),
-                }, requireSha256: true, sharedClient: sharedClient, populator: populator);
-                return adapter;
+                    exchangeFailure = ExceptionDispatchInfo.Capture(exception);
+                    throw;
+                }
             }
             finally { mutex.Release(); }
         }
