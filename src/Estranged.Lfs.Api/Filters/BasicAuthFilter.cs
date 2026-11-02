@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using System.Threading;
+using System.Data.Common;
 
 namespace Estranged.Lfs.Api.Filters
 {
@@ -16,12 +17,15 @@ namespace Estranged.Lfs.Api.Filters
         private readonly ILogger<BasicAuthFilter> logger;
         private readonly IAuthenticator authenticator;
         private readonly IRepositoryAuthenticator repositoryAuthenticator;
+        private readonly LfsBatchOptions options;
 
-        public BasicAuthFilter(ILogger<BasicAuthFilter> logger, IAuthenticator authenticator, System.Collections.Generic.IEnumerable<IRepositoryAuthenticator> repositoryAuthenticators)
+        public BasicAuthFilter(ILogger<BasicAuthFilter> logger, IAuthenticator authenticator, System.Collections.Generic.IEnumerable<IRepositoryAuthenticator> repositoryAuthenticators,
+            LfsBatchOptions options = null)
         {
             this.logger = logger;
             this.authenticator = authenticator;
             repositoryAuthenticator = repositoryAuthenticators.SingleOrDefault();
+            this.options = options ?? new LfsBatchOptions();
         }
 
         public string AuthorizationHeader => "Authorization";
@@ -36,6 +40,19 @@ namespace Estranged.Lfs.Api.Filters
         {
             context.Result = new StatusCodeResult(403);
         }
+
+        // An identity provider, issuer or registry database that is briefly
+        // unavailable says nothing about the credentials, so the client is
+        // asked to retry rather than told its credentials are wrong.
+        private void RetryLater(ActionExecutingContext context, Exception exception, string authenticatorName)
+        {
+            logger.LogWarning(exception, "{Authenticator} is temporarily unavailable for {Org}/{Repo}; asking the client to retry",
+                authenticatorName, context.RouteData.Values["org"], context.RouteData.Values["repo"]);
+            context.Result = LfsResults.RetryLater(context.HttpContext, options, "Authentication is temporarily unavailable.");
+        }
+
+        private static bool IsTransient(Exception exception) =>
+            exception is TransientUpstreamException || exception is DbException database && database.IsTransient;
 
         private (string Username, string Password) GetCredentials(IHeaderDictionary headers)
         {
@@ -87,6 +104,7 @@ namespace Estranged.Lfs.Api.Filters
                 }
                 catch (UnauthorizedAccessException) { Forbidden(context); return; }
                 catch (System.Security.Authentication.AuthenticationException) { Unauthorised(context); return; }
+                catch (Exception e) when (IsTransient(e)) { RetryLater(context, e, repositoryAuthenticator.GetType().Name); return; }
                 await next();
                 return;
             }
@@ -115,7 +133,18 @@ namespace Estranged.Lfs.Api.Filters
             {
                 string organisation = context.RouteData.Values.TryGetValue("org", out object org) ? org?.ToString() : null;
                 string repository = context.RouteData.Values.TryGetValue("repo", out object repo) ? repo?.ToString() : null;
-                await authenticator.Authenticate(username, password, organisation, repository, GetRequiredPermission(context), CancellationToken.None).ConfigureAwait(false);
+                await authenticator.Authenticate(username, password, organisation, repository, GetRequiredPermission(context), context.HttpContext.RequestAborted).ConfigureAwait(false);
+            }
+            catch (Exception e) when (IsTransient(e))
+            {
+                RetryLater(context, e, authenticator.GetType().Name);
+                return;
+            }
+            catch (OperationCanceledException) when (context.HttpContext.RequestAborted.IsCancellationRequested)
+            {
+                logger.LogDebug("Client disconnected during authentication");
+                context.Result = new StatusCodeResult(StatusCodes.Status499ClientClosedRequest);
+                return;
             }
             catch (UnauthorizedAccessException e)
             {

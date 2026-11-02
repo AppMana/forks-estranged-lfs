@@ -1,5 +1,6 @@
 ﻿using Estranged.Lfs.Data;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Estranged.Lfs.Api
 {
@@ -10,6 +11,7 @@ namespace Estranged.Lfs.Api
             services.AddMvcCore()
                     .AddGitLfs();
 
+            services.TryAddSingleton(new LfsBatchOptions());
             services.AddLfsData();
             return services;
         }

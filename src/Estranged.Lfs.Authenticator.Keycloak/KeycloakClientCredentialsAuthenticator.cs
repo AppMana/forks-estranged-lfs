@@ -21,11 +21,21 @@ namespace Estranged.Lfs.Authenticator.Keycloak
         private readonly HttpClient httpClient;
         private readonly IKeycloakAuthenticatorConfig config;
         private readonly ConcurrentDictionary<string, CacheEntry> cache = new();
+        private readonly TransientRetryPolicy retryPolicy;
 
-        public KeycloakClientCredentialsAuthenticator(HttpClient httpClient, IKeycloakAuthenticatorConfig config)
+        public static readonly TransientRetryPolicy DefaultRetryPolicy = new()
+        {
+            MaxAttempts = 3,
+            InitialDelay = TimeSpan.FromMilliseconds(250),
+            MaxDelay = TimeSpan.FromSeconds(1),
+            AttemptTimeout = TimeSpan.FromSeconds(5)
+        };
+
+        public KeycloakClientCredentialsAuthenticator(HttpClient httpClient, IKeycloakAuthenticatorConfig config, TransientRetryPolicy retryPolicy = null)
         {
             this.httpClient = httpClient;
             this.config = config;
+            this.retryPolicy = retryPolicy ?? DefaultRetryPolicy;
         }
 
         public async Task Authenticate(string username, string password, string organisation, string repository, LfsPermission requiredPermission, CancellationToken token)
@@ -86,17 +96,31 @@ namespace Estranged.Lfs.Authenticator.Keycloak
                 return;
             }
 
-            using var response = await httpClient.PostAsync(
-                $"{config.RealmUrl.TrimEnd('/')}/protocol/openid-connect/token",
-                new FormUrlEncodedContent(grant),
-                token).ConfigureAwait(false);
-
-            if (!response.IsSuccessStatusCode)
+            // Keycloak being unavailable is not a verdict on the credentials: a
+            // throttled, failing or unreachable token endpoint is retried and
+            // then reported as transient, while a 4xx answer is a rejection.
+            string body = await TransientRetry.ExecuteAsync("Keycloak", retryPolicy, TransientRetry.IsTransientNetworkFailure, async attempt =>
             {
-                throw new InvalidOperationException($"Keycloak rejected client credentials for {clientId}: {(int)response.StatusCode}");
-            }
+                using var response = await httpClient.PostAsync(
+                    $"{config.RealmUrl.TrimEnd('/')}/protocol/openid-connect/token",
+                    new FormUrlEncodedContent(grant),
+                    attempt).ConfigureAwait(false);
 
-            using JsonDocument doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync(token).ConfigureAwait(false));
+                int status = (int)response.StatusCode;
+                if (TransientRetry.IsTransientStatus(status))
+                {
+                    throw new HttpRequestException($"Keycloak token endpoint returned {status} for {clientId}", null, response.StatusCode);
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    throw new InvalidOperationException($"Keycloak rejected client credentials for {clientId}: {status}");
+                }
+
+                return await response.Content.ReadAsStringAsync(attempt).ConfigureAwait(false);
+            }, token).ConfigureAwait(false);
+
+            using JsonDocument doc = JsonDocument.Parse(body);
             string accessToken = doc.RootElement.GetProperty("access_token").GetString();
             if (!HasRealmRole(accessToken, config.RequiredRole))
             {

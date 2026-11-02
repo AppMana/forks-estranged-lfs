@@ -18,6 +18,7 @@ namespace Estranged.Lfs.Tests.Authenticator.Keycloak
         {
             public List<Dictionary<string, string>> Forms { get; } = new();
             public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
+            public Queue<object> Script { get; } = new();
             public string AccessToken { get; set; } = Jwt(new Dictionary<string, object> { ["realm_access"] = new Dictionary<string, object> { ["roles"] = new[] { "lfs" } } });
 
             protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
@@ -31,7 +32,14 @@ namespace Estranged.Lfs.Tests.Authenticator.Keycloak
                     form[key] = parsed[key];
                 }
                 Forms.Add(form);
-                return new HttpResponseMessage(Status)
+                var status = Status;
+                if (Script.TryDequeue(out var step))
+                {
+                    if (step is Exception failure) throw failure;
+                    if (step is TimeSpan delay) await Task.Delay(delay, cancellationToken);
+                    else status = (HttpStatusCode)step;
+                }
+                return new HttpResponseMessage(status)
                 {
                     Content = new StringContent($"{{\"access_token\":\"{AccessToken}\"}}", Encoding.UTF8, "application/json"),
                 };
@@ -49,13 +57,21 @@ namespace Estranged.Lfs.Tests.Authenticator.Keycloak
         private static string Assertion(string subject = Subject) =>
             Jwt(new Dictionary<string, object> { ["sub"] = subject, ["iss"] = "https://kubernetes.default.svc" });
 
+        private static readonly TransientRetryPolicy Fast = new()
+        {
+            MaxAttempts = 3,
+            InitialDelay = TimeSpan.Zero,
+            MaxDelay = TimeSpan.Zero,
+            AttemptTimeout = TimeSpan.FromMilliseconds(200)
+        };
+
         private static (KeycloakClientCredentialsAuthenticator Authenticator, RecordingHandler Handler) Create()
         {
             var handler = new RecordingHandler();
             var authenticator = new KeycloakClientCredentialsAuthenticator(new HttpClient(handler), new KeycloakAuthenticatorConfig
             {
                 RealmUrl = "https://login.example/realms/appmana/",
-            });
+            }, Fast);
             return (authenticator, handler);
         }
 
@@ -122,6 +138,41 @@ namespace Estranged.Lfs.Tests.Authenticator.Keycloak
 
             await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 authenticator.Authenticate("assertion", Assertion(), "AppMana", "game", LfsPermission.Read, CancellationToken.None));
+            Assert.Single(handler.Forms);
+        }
+
+        [Fact]
+        public async Task TransientKeycloakFailuresAreRetried()
+        {
+            var (authenticator, handler) = Create();
+            handler.Script.Enqueue(HttpStatusCode.ServiceUnavailable);
+            handler.Script.Enqueue(new HttpRequestException("Connection refused"));
+
+            await authenticator.Authenticate("t", "repository-secret", "AppMana", "game", LfsPermission.Read, CancellationToken.None);
+
+            Assert.Equal(3, handler.Forms.Count);
+        }
+
+        [Fact]
+        public async Task HungKeycloakAttemptsTimeOutAndAreRetried()
+        {
+            var (authenticator, handler) = Create();
+            handler.Script.Enqueue(Timeout.InfiniteTimeSpan);
+
+            await authenticator.Authenticate("t", "repository-secret", "AppMana", "game", LfsPermission.Read, CancellationToken.None);
+
+            Assert.Equal(2, handler.Forms.Count);
+        }
+
+        [Fact]
+        public async Task ExhaustedKeycloakFailuresAskTheClientToRetryInsteadOfRejectingCredentials()
+        {
+            var (authenticator, handler) = Create();
+            handler.Status = HttpStatusCode.BadGateway;
+
+            await Assert.ThrowsAsync<TransientUpstreamException>(() =>
+                authenticator.Authenticate("t", "repository-secret", "AppMana", "game", LfsPermission.Read, CancellationToken.None));
+            Assert.Equal(3, handler.Forms.Count);
         }
 
         [Fact]
