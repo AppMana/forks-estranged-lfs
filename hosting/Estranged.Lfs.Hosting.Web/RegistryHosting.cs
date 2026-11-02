@@ -5,6 +5,7 @@ using System.Linq;
 using System.IdentityModel.Tokens.Jwt;
 using System.Net.Http;
 using System.Net.Security;
+using System.Runtime.ExceptionServices;
 using System.Security.Authentication;
 using System.Security.Claims;
 using System.Security.Cryptography;
@@ -95,7 +96,11 @@ public sealed class FederatedIdentityVerifier : IIdentityVerifier
 {
     readonly Dictionary<string, ConfigurationManager<OpenIdConnectConfiguration>> issuers = new(StringComparer.Ordinal);
     readonly string audience;
-    public FederatedIdentityVerifier(string document, string audience, Func<TrustedIssuer, HttpClient> clients = null)
+    public static readonly TransientRetryPolicy DefaultRetryPolicy = new()
+    {
+        MaxAttempts = 3, InitialDelay = TimeSpan.FromMilliseconds(250), MaxDelay = TimeSpan.FromSeconds(1), AttemptTimeout = TimeSpan.FromSeconds(5)
+    };
+    public FederatedIdentityVerifier(string document, string audience, Func<TrustedIssuer, HttpClient> clients = null, TransientRetryPolicy retryPolicy = null)
     {
         this.audience = audience;
         var definitions = JsonSerializer.Deserialize<TrustedIssuer[]>(document, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
@@ -118,7 +123,7 @@ public sealed class FederatedIdentityVerifier : IIdentityVerifier
                 };
             }
             var client = clients?.Invoke(definition) ?? new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(15) };
-            var retriever = new IssuerDocumentRetriever(client, definition);
+            var retriever = new IssuerDocumentRetriever(client, definition, retryPolicy ?? DefaultRetryPolicy);
             issuers.Add(definition.Issuer, new ConfigurationManager<OpenIdConnectConfiguration>(definition.Issuer.TrimEnd('/') + "/.well-known/openid-configuration", new OpenIdConnectConfigurationRetriever(), retriever));
         }
     }
@@ -147,8 +152,18 @@ public sealed class FederatedIdentityVerifier : IIdentityVerifier
             var identity = new Principal(configuration.Issuer, subject); identity.Validate();
             return new VerifiedIdentity(identity, validated.ValidTo);
         }
+        // An issuer whose discovery or keys are briefly unreachable has not
+        // judged the identity; the configuration manager wraps that failure.
+        catch (Exception ex) when (Transient(ex) is TransientUpstreamException transient)
+        { ExceptionDispatchInfo.Capture(transient).Throw(); throw; }
         catch (Exception ex) when (ex is SecurityTokenException || ex is ArgumentException || ex is InvalidOperationException)
         { throw new AuthenticationException("Invalid identity."); }
+    }
+    static TransientUpstreamException Transient(Exception exception)
+    {
+        for (var current = exception; current != null; current = current.InnerException)
+            if (current is TransientUpstreamException transient) return transient;
+        return null;
     }
     TokenValidationParameters Parameters(OpenIdConnectConfiguration configuration) => new()
     {
@@ -164,17 +179,21 @@ sealed class IssuerDocumentRetriever : IDocumentRetriever
 {
     readonly HttpClient client;
     readonly TrustedIssuer issuer;
-    public IssuerDocumentRetriever(HttpClient client, TrustedIssuer issuer) { this.client = client; this.issuer = issuer; }
+    readonly TransientRetryPolicy retryPolicy;
+    public IssuerDocumentRetriever(HttpClient client, TrustedIssuer issuer, TransientRetryPolicy retryPolicy) { this.client = client; this.issuer = issuer; this.retryPolicy = retryPolicy; }
     public async Task<string> GetDocumentAsync(string address, CancellationToken cancel)
     {
         var uri = new Uri(address);
         if (uri.Scheme != "https" || uri.GetLeftPart(UriPartial.Authority) != new Uri(issuer.Issuer).GetLeftPart(UriPartial.Authority)) throw new AuthenticationException("Discovery origin is not trusted.");
-        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
-        if (issuer.DiscoveryTokenFile != null)
-            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", (await File.ReadAllTextAsync(issuer.DiscoveryTokenFile, cancel)).Trim());
-        using var response = await client.SendAsync(request, cancel);
-        response.EnsureSuccessStatusCode();
-        return await response.Content.ReadAsStringAsync(cancel);
+        return await TransientRetry.ExecuteAsync("identity issuer discovery", retryPolicy, TransientRetry.IsTransientNetworkFailure, async attempt =>
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+            if (issuer.DiscoveryTokenFile != null)
+                request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", (await File.ReadAllTextAsync(issuer.DiscoveryTokenFile, attempt)).Trim());
+            using var response = await client.SendAsync(request, attempt);
+            response.EnsureSuccessStatusCode();
+            return await response.Content.ReadAsStringAsync(attempt);
+        }, cancel);
     }
 }
 public sealed class StorageTokenIssuer : IStorageTokenIssuer, IDisposable

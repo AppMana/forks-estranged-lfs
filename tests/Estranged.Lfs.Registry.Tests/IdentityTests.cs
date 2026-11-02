@@ -14,6 +14,8 @@ public sealed class IdentityTests
     sealed class Discovery : HttpMessageHandler
     {
         public int Calls;
+        public HttpStatusCode Status = HttpStatusCode.OK;
+        public readonly Queue<object> Script = new();
         readonly string jwks;
         public Discovery(RSA rsa)
         {
@@ -24,8 +26,14 @@ public sealed class IdentityTests
         {
             Calls++;
             Assert.Equal("https://identity.test", request.RequestUri.GetLeftPart(UriPartial.Authority));
+            var status = Status;
+            if (Script.TryDequeue(out var step))
+            {
+                if (step is Exception failure) throw failure;
+                status = (HttpStatusCode)step;
+            }
             var json = request.RequestUri.AbsolutePath == "/keys" ? jwks : "{\"issuer\":\"https://identity.test\",\"jwks_uri\":\"https://identity.test/keys\"}";
-            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(json) });
+            return Task.FromResult(new HttpResponseMessage(status) { Content = new StringContent(json) });
         }
     }
     static string Token(RSA rsa, string issuer = "https://identity.test", string audience = "https://lfs.test", bool expired = false)
@@ -50,6 +58,41 @@ public sealed class IdentityTests
         else await Assert.ThrowsAsync<AuthenticationException>(() => verifier.Verify(token, default));
         if (scenario == "issuer") Assert.Equal(0, discovery.Calls);
     }
+    static readonly TransientRetryPolicy Fast = new() { MaxAttempts = 3, InitialDelay = TimeSpan.Zero, MaxDelay = TimeSpan.Zero };
+
+    [Fact]
+    public async Task TransientDiscoveryFailuresAreRetried()
+    {
+        using var rsa = RSA.Create(2048);
+        using var discovery = new Discovery(rsa); using var client = new HttpClient(discovery);
+        discovery.Script.Enqueue(HttpStatusCode.ServiceUnavailable);
+        discovery.Script.Enqueue(new HttpRequestException("Connection refused"));
+        var verifier = new FederatedIdentityVerifier("[{\"issuer\":\"https://identity.test\"}]", "https://lfs.test", _ => client, Fast);
+        Assert.Equal("controller", (await verifier.Verify(Token(rsa), default)).Principal.Subject);
+    }
+
+    [Fact]
+    public async Task UnavailableDiscoveryAsksTheClientToRetryAndRecoversOnTheNextRequest()
+    {
+        using var rsa = RSA.Create(2048);
+        using var discovery = new Discovery(rsa) { Status = HttpStatusCode.BadGateway }; using var client = new HttpClient(discovery);
+        var verifier = new FederatedIdentityVerifier("[{\"issuer\":\"https://identity.test\"}]", "https://lfs.test", _ => client, Fast);
+        await Assert.ThrowsAsync<TransientUpstreamException>(() => verifier.Verify(Token(rsa), default));
+        Assert.Equal(3, discovery.Calls);
+        discovery.Status = HttpStatusCode.OK;
+        Assert.Equal("controller", (await verifier.Verify(Token(rsa), default)).Principal.Subject);
+    }
+
+    [Fact]
+    public async Task DiscoveryRejectionIsAnAuthenticationFailureWithoutRetry()
+    {
+        using var rsa = RSA.Create(2048);
+        using var discovery = new Discovery(rsa) { Status = HttpStatusCode.NotFound }; using var client = new HttpClient(discovery);
+        var verifier = new FederatedIdentityVerifier("[{\"issuer\":\"https://identity.test\"}]", "https://lfs.test", _ => client, Fast);
+        await Assert.ThrowsAsync<AuthenticationException>(() => verifier.Verify(Token(rsa), default));
+        Assert.Equal(1, discovery.Calls);
+    }
+
     [Fact] public void StorageTokensCarryOnlyValidatedScopeAndBoundedLifetime()
     {
         using var rsa = RSA.Create(2048); using var issuer = new StorageTokenIssuer("https://lfs.test", rsa.ExportRSAPrivateKeyPem());

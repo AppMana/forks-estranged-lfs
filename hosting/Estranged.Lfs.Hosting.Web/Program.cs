@@ -237,10 +237,12 @@ sealed class WebIdentityStsCredentials : RefreshingAWSCredentials
     readonly string roleArn;
     readonly string roleSessionName;
     readonly string tokenFile;
-    static readonly HttpClient http = new();
+    static readonly HttpClient sharedHttp = new();
+    readonly HttpClient http;
 
-    public WebIdentityStsCredentials(string endpoint, string roleArn, string roleSessionName, string tokenFile)
+    public WebIdentityStsCredentials(string endpoint, string roleArn, string roleSessionName, string tokenFile, HttpClient http = null)
     {
+        this.http = http ?? sharedHttp;
         this.endpoint = endpoint;
         this.roleArn = roleArn;
         this.roleSessionName = roleSessionName;
@@ -264,6 +266,10 @@ sealed class WebIdentityStsCredentials : RefreshingAWSCredentials
         });
         using var response = await http.PostAsync(endpoint, form);
         string body = await response.Content.ReadAsStringAsync();
+        // Throttling and server errors surface as transient so the storage
+        // adapter retries them and then asks the client to retry the batch.
+        if (TransientRetry.IsTransientStatus((int)response.StatusCode))
+            throw new HttpRequestException($"SeaweedFS STS returned {(int)response.StatusCode}", null, response.StatusCode);
         if (!response.IsSuccessStatusCode)
             throw new InvalidOperationException($"SeaweedFS STS returned {(int)response.StatusCode}: {body}");
 

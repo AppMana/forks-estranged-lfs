@@ -16,4 +16,8 @@
     <ProjectReference Include="..\..\src\Estranged.Lfs.Adapter.Azure.Blob\Estranged.Lfs.Adapter.Azure.Blob.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Estranged.Lfs.Registry.Tests" />
+  </ItemGroup>
+
 </Project>
