@@ -1,6 +1,12 @@
+using Amazon.Runtime;
+using Amazon.S3;
+using Amazon.S3.Model;
 using Estranged.Lfs.Adapter.S3;
 using Estranged.Lfs.Data;
+using Microsoft.Extensions.Logging;
+using Moq;
 using System;
+using System.Linq;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
@@ -115,6 +121,116 @@ namespace Estranged.Lfs.Tests.Adapter.S3
             await Assert.ThrowsAsync<UnauthorizedAccessException>(() => adapter.UriForUpload(Oid, 1, CancellationToken.None));
             await Assert.ThrowsAsync<UnauthorizedAccessException>(() => adapter.UriForUpload(Oid, 1, CancellationToken.None));
             Assert.Equal(1, handler.Calls);
+        }
+
+        sealed class RecordingLogger : ILogger
+        {
+            public readonly List<(LogLevel Level, string Message, IReadOnlyList<KeyValuePair<string, object>> State)> Entries = new();
+            public IDisposable BeginScope<TState>(TState state) => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
+            {
+                lock (Entries) Entries.Add((logLevel, formatter(state, exception) + " " + exception, state as IReadOnlyList<KeyValuePair<string, object>> ?? Array.Empty<KeyValuePair<string, object>>()));
+            }
+        }
+
+        static AmazonS3Exception Forbidden() =>
+            new("Access Denied", ErrorType.Sender, "AccessDenied", "requestId", HttpStatusCode.Forbidden);
+
+        // Each STS exchange builds a new scoped client; the queue hands out one
+        // per exchange so tests can tell whether a retry used fresh credentials.
+        static Func<AWSCredentials, AmazonS3Config, IAmazonS3> Clients(Queue<Func<GetObjectMetadataResponse>> heads, List<string> sessions)
+        {
+            return (credentials, config) =>
+            {
+                sessions.Add(credentials.GetCredentials().Token);
+                var head = heads.Dequeue();
+                var client = new Mock<IAmazonS3>();
+                client.Setup(x => x.Config).Returns(config);
+                client.Setup(x => x.GetObjectMetadataAsync("lfs", "AppMana/lbxx/" + Oid, It.IsAny<CancellationToken>()))
+                      .Returns(() => Task.FromResult(head()));
+                client.Setup(x => x.GetPreSignedURL(It.IsAny<GetPreSignedUrlRequest>()))
+                      .Returns((GetPreSignedUrlRequest request) => $"https://s3.example/{request.BucketName}/{request.Key}?verb={request.Verb}");
+                return client.Object;
+            };
+        }
+
+        static void AssertForbiddenWarnings(RecordingLogger logger, int count)
+        {
+            var warnings = logger.Entries.Where(x => x.Level == LogLevel.Warning).ToList();
+            Assert.Equal(count, warnings.Count);
+            foreach (var warning in warnings)
+            {
+                var state = warning.State.ToDictionary(x => x.Key, x => x.Value);
+                Assert.Equal(Repo, state["RepositoryId"]);
+                Assert.Equal(Oid, state["Oid"]);
+                foreach (var secret in new[] { "scoped-secret", "scoped-session", "repository-token", "X-Amz-Signature" })
+                    Assert.DoesNotContain(secret, warning.Message);
+            }
+        }
+
+        [Fact]
+        public async Task ScopedForbiddenMetadataIsRetriedWithFreshStorageCredentials()
+        {
+            var handler = new StsHandler();
+            using var http = new HttpClient(handler);
+            var sessions = new List<string>();
+            var heads = new Queue<Func<GetObjectMetadataResponse>>(new Func<GetObjectMetadataResponse>[]
+            {
+                () => throw Forbidden(),
+                () => new GetObjectMetadataResponse { ContentLength = 5 },
+            });
+            var logger = new RecordingLogger();
+            using var adapter = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http,
+                retryPolicy: Fast, logger: logger, clientFactory: Clients(heads, sessions));
+
+            var signed = await adapter.UriForDownload(Oid, CancellationToken.None);
+
+            Assert.Null(signed.ErrorCode);
+            Assert.Equal(5, signed.Size);
+            Assert.Equal(2, handler.Calls);
+            Assert.Equal(2, sessions.Count);
+            AssertForbiddenWarnings(logger, 1);
+        }
+
+        [Fact]
+        public async Task PersistentScopedForbiddenFailsTheBatchRetryablyInsteadOfTheObject()
+        {
+            var handler = new StsHandler();
+            using var http = new HttpClient(handler);
+            var sessions = new List<string>();
+            var heads = new Queue<Func<GetObjectMetadataResponse>>(Enumerable.Repeat<Func<GetObjectMetadataResponse>>(() => throw Forbidden(), 3));
+            var logger = new RecordingLogger();
+            using var adapter = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http,
+                retryPolicy: Fast, logger: logger, clientFactory: Clients(heads, sessions));
+
+            var failure = await Assert.ThrowsAsync<TransientUpstreamException>(() => adapter.UriForDownload(Oid, CancellationToken.None));
+
+            Assert.IsType<AmazonS3Exception>(failure.InnerException?.InnerException ?? failure.InnerException);
+            Assert.Equal(3, handler.Calls);
+            AssertForbiddenWarnings(logger, 3);
+        }
+
+        [Fact]
+        public async Task ScopedForbiddenDeduplicationHeadIsRetriedWithFreshStorageCredentials()
+        {
+            var handler = new StsHandler();
+            using var http = new HttpClient(handler);
+            var sessions = new List<string>();
+            var heads = new Queue<Func<GetObjectMetadataResponse>>(new Func<GetObjectMetadataResponse>[]
+            {
+                () => throw Forbidden(),
+                () => new GetObjectMetadataResponse { ContentLength = 7 },
+            });
+            var logger = new RecordingLogger();
+            using var adapter = new RepositoryScopedS3BlobAdapter(Grant(), Repo, "lfs", "https://s3.example", "http://sts.example", http,
+                deduplicateUploads: true, retryPolicy: Fast, logger: logger, clientFactory: Clients(heads, sessions));
+
+            var signed = await adapter.UriForUpload(Oid, 7, CancellationToken.None);
+
+            Assert.True(signed.AlreadyExists);
+            Assert.Equal(2, handler.Calls);
+            AssertForbiddenWarnings(logger, 1);
         }
 
         [Theory]

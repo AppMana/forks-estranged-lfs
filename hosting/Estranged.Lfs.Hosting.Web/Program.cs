@@ -163,7 +163,8 @@ if (isS3)
             if (!registryEnabled) throw new InvalidOperationException("UUID repository service is not configured.");
             return new RepositoryScopedS3BlobAdapter(sp.GetRequiredService<RepositoryGrant>(),
                 http.Request.RouteValues["repo"]?.ToString(), lfsBucket, s3Endpoint, stsEndpoint,
-                sp.GetRequiredService<HttpClient>(), rootS3, sharedKeyPrefix, deduplicateUploads, populator);
+                sp.GetRequiredService<HttpClient>(), rootS3, sharedKeyPrefix, deduplicateUploads, populator,
+                logger: sp.GetRequiredService<ILogger<RepositoryScopedS3BlobAdapter>>());
         }
         string routePrefix = RouteObjectKeyPrefix(http);
         IBlobAdapter primary = new S3BlobAdapter(rootS3, new S3BlobAdapterConfig

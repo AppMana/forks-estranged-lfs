@@ -1,6 +1,8 @@
 using Amazon.Runtime;
 using Amazon.S3;
 using Estranged.Lfs.Data;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -30,15 +32,21 @@ namespace Estranged.Lfs.Adapter.S3
         private readonly ISharedObjectPopulator populator;
         private readonly TransientRetryPolicy retryPolicy;
         private ExceptionDispatchInfo exchangeFailure;
+        private readonly ILogger logger;
+        private readonly Func<AWSCredentials, AmazonS3Config, IAmazonS3> clientFactory;
         private readonly SemaphoreSlim mutex = new(1, 1);
         private IAmazonS3 client;
+        private readonly List<IAmazonS3> retired = new();
         private S3BlobAdapter adapter;
 
         public RepositoryScopedS3BlobAdapter(RepositoryGrant grant, string repositoryId,
             string bucket, string endpoint, string stsEndpoint, HttpClient http,
             IAmazonS3 sharedClient = null, string sharedKeyPrefix = null, bool deduplicateUploads = false,
-            ISharedObjectPopulator populator = null, TransientRetryPolicy retryPolicy = null)
+            ISharedObjectPopulator populator = null, TransientRetryPolicy retryPolicy = null,
+            ILogger logger = null, Func<AWSCredentials, AmazonS3Config, IAmazonS3> clientFactory = null)
         {
+            this.logger = logger ?? NullLogger.Instance;
+            this.clientFactory = clientFactory ?? ((credentials, config) => new AmazonS3Client(credentials, config));
             this.grant = grant;
             this.repositoryId = repositoryId;
             this.bucket = bucket;
@@ -113,7 +121,7 @@ namespace Estranged.Lfs.Adapter.S3
                         TransientRetry.IsTransientNetworkFailure, ExchangeAsync, token).ConfigureAwait(false);
                     var lifetime = credentials.Expiration - DateTimeOffset.UtcNow - TimeSpan.FromSeconds(10);
                     if (lifetime <= TimeSpan.Zero) throw new UnauthorizedAccessException("Storage credentials already expired.");
-                    client = new AmazonS3Client(new SessionAWSCredentials(credentials.AccessKeyId, credentials.SecretAccessKey, credentials.SessionToken),
+                    client = clientFactory(new SessionAWSCredentials(credentials.AccessKeyId, credentials.SecretAccessKey, credentials.SessionToken),
                         S3ClientDefaults.Apply(new AmazonS3Config { ServiceURL = endpoint, ForcePathStyle = true, SignatureVersion = "4", AuthenticationRegion = "us-east-1" }));
                     adapter = new S3BlobAdapter(client, new S3BlobAdapterConfig
                     {
@@ -122,7 +130,7 @@ namespace Estranged.Lfs.Adapter.S3
                         SharedKeyPrefix = sharedKeyPrefix,
                         DeduplicateUploads = deduplicateUploads,
                         Expiry = lifetime < TimeSpan.FromMinutes(5) ? lifetime : TimeSpan.FromMinutes(5),
-                    }, requireSha256: true, sharedClient: sharedClient, populator: populator);
+                    }, requireSha256: true, sharedClient: sharedClient, populator: populator, forbiddenIsTransient: true);
                     return adapter;
                 }
                 catch (Exception exception) when (exception is UnauthorizedAccessException || exception is TransientUpstreamException)
@@ -134,19 +142,68 @@ namespace Estranged.Lfs.Adapter.S3
             finally { mutex.Release(); }
         }
 
-        public async Task<SignedBlob> UriForDownload(string oid, CancellationToken token)
+        // SeaweedFS intermittently answers 403 to requests signed with the
+        // scoped session inside the granted prefix. Retry with a fresh STS
+        // exchange; when that keeps failing, fail the batch retryably, because
+        // git-lfs never retries a per-object error.
+        private async Task<SignedBlob> RetryForbiddenAsync(string oid, Func<S3BlobAdapter, CancellationToken, Task<SignedBlob>> operation, CancellationToken token)
         {
-            ValidateOid(oid);
-            return await (await Adapter(token).ConfigureAwait(false)).UriForDownload(oid, token).ConfigureAwait(false);
+            var policy = new TransientRetryPolicy
+            {
+                MaxAttempts = retryPolicy.MaxAttempts,
+                InitialDelay = retryPolicy.InitialDelay,
+                MaxDelay = retryPolicy.MaxDelay
+            };
+            return await TransientRetry.ExecuteAsync("repository storage", policy, exception => exception is StorageForbiddenException, async attempt =>
+            {
+                var current = await Adapter(attempt).ConfigureAwait(false);
+                try
+                {
+                    return await operation(current, attempt).ConfigureAwait(false);
+                }
+                catch (StorageForbiddenException exception)
+                {
+                    logger.LogWarning(exception, "Repository storage answered 403 for repository {RepositoryId} object {Oid}; retrying with fresh credentials",
+                        repositoryId, oid);
+                    await DiscardAsync(current).ConfigureAwait(false);
+                    throw;
+                }
+            }, token).ConfigureAwait(false);
         }
 
-        public async Task<SignedBlob> UriForUpload(string oid, long size, CancellationToken token)
+        // Concurrent lookups may still hold the rejected client, so it is
+        // disposed with the adapter rather than immediately.
+        private async Task DiscardAsync(S3BlobAdapter rejected)
+        {
+            await mutex.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                if (!ReferenceEquals(adapter, rejected)) return;
+                adapter = null;
+                retired.Add(client);
+                client = null;
+            }
+            finally { mutex.Release(); }
+        }
+
+        public Task<SignedBlob> UriForDownload(string oid, CancellationToken token)
+        {
+            ValidateOid(oid);
+            return RetryForbiddenAsync(oid, (current, attempt) => current.UriForDownload(oid, attempt), token);
+        }
+
+        public Task<SignedBlob> UriForUpload(string oid, long size, CancellationToken token)
         {
             ValidateOid(oid);
             if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
-            return await (await Adapter(token).ConfigureAwait(false)).UriForUpload(oid, size, token).ConfigureAwait(false);
+            return RetryForbiddenAsync(oid, (current, attempt) => current.UriForUpload(oid, size, attempt), token);
         }
 
-        public void Dispose() { client?.Dispose(); mutex.Dispose(); }
+        public void Dispose()
+        {
+            client?.Dispose();
+            foreach (var old in retired) old?.Dispose();
+            mutex.Dispose();
+        }
     }
 }

@@ -30,10 +30,16 @@ namespace Estranged.Lfs.Adapter.S3
         private readonly IAmazonS3 sharedClient;
         private readonly ISharedObjectPopulator populator;
         private readonly TransientRetryPolicy retryPolicy;
+        private readonly bool forbiddenIsTransient;
 
+        /// <param name="forbiddenIsTransient">
+        /// Raise <see cref="StorageForbiddenException"/> for a 403 on the
+        /// repository's own keys instead of reporting it as the object's outcome.
+        /// </param>
         public S3BlobAdapter(IAmazonS3 client, IS3BlobAdapterConfig config, bool requireSha256 = false, IAmazonS3 sharedClient = null,
-            ISharedObjectPopulator populator = null, TransientRetryPolicy retryPolicy = null)
+            ISharedObjectPopulator populator = null, TransientRetryPolicy retryPolicy = null, bool forbiddenIsTransient = false)
         {
+            this.forbiddenIsTransient = forbiddenIsTransient;
             this.client = client;
             this.config = config;
             this.requireSha256 = requireSha256;
@@ -125,6 +131,10 @@ namespace Estranged.Lfs.Adapter.S3
                 metadataResponse = await TransientRetry.ExecuteAsync("object storage", retryPolicy, IsTransientStorageFailure,
                     attempt => client.GetObjectMetadataAsync(config.Bucket, config.KeyPrefix + oid, attempt), token).ConfigureAwait(false);
             }
+            catch (AmazonS3Exception ex) when (forbiddenIsTransient && ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
+            {
+                throw new StorageForbiddenException(ex);
+            }
             catch (AmazonS3Exception ex)
             {
                 return new SignedBlob
@@ -176,7 +186,19 @@ namespace Estranged.Lfs.Adapter.S3
             try
             {
                 string repoKey = config.KeyPrefix + oid;
-                var existing = await TryGetObjectMetadataAsync(client, config.Bucket, repoKey, bounded.Token).ConfigureAwait(false);
+                GetObjectMetadataResponse existing;
+                try
+                {
+                    existing = await client.GetObjectMetadataAsync(config.Bucket, repoKey, bounded.Token).ConfigureAwait(false);
+                }
+                catch (AmazonS3Exception ex) when (forbiddenIsTransient && ex.StatusCode == System.Net.HttpStatusCode.Forbidden)
+                {
+                    throw new StorageForbiddenException(ex);
+                }
+                catch (AmazonS3Exception)
+                {
+                    existing = null;
+                }
                 if (existing != null && (size <= 0 || existing.ContentLength == size))
                 {
                     QueueSharedObject(oid);
