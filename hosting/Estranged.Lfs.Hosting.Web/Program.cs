@@ -31,10 +31,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-// Trace AWS SDK calls so we can see any request/sign mismatches.
-Amazon.AWSConfigs.LoggingConfig.LogTo = Amazon.LoggingOptions.Console;
-Amazon.AWSConfigs.LoggingConfig.LogResponses = Amazon.ResponseLoggingOption.Never;
-Amazon.AWSConfigs.LoggingConfig.LogMetrics = false;
+// Configured before any client exists: SDK loggers capture their listeners
+// when first created. Records reach the JSON log once the host is built.
+var awsSdkLog = AwsSdkLogging.Configure();
 
 if (args.Contains("--migrate"))
 {
@@ -197,6 +196,7 @@ services.AddLfsApi();
 
 // Health endpoint without auth, plus the LFS controllers.
 var app = builder.Build();
+awsSdkLog.Attach(app.Services.GetRequiredService<ILoggerFactory>());
 if (registryEnabled) RegistryHosting.Map(app);
 app.MapGet("/healthz", () => Results.Ok(new { ok = true, mode = isS3 ? "s3" : "azure", bucket = lfsBucket }));
 app.UseRouting();

@@ -40,6 +40,43 @@ public sealed class LoggingTests
         Assert.True(factory.CreateLogger("Estranged.Lfs.Api.Filters.BasicAuthFilter").IsEnabled(LogLevel.Information));
     }
 
+    sealed class RecordingProvider : ILoggerProvider
+    {
+        public readonly List<(string Category, LogLevel Level, string Message, Exception Exception)> Entries = new();
+        sealed class Recorder : ILogger
+        {
+            readonly RecordingProvider provider; readonly string category;
+            public Recorder(RecordingProvider provider, string category) { this.provider = provider; this.category = category; }
+            public IDisposable BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
+            {
+                lock (provider.Entries) provider.Entries.Add((category, logLevel, formatter(state, exception), exception));
+            }
+        }
+        public ILogger CreateLogger(string categoryName) => new Recorder(this, categoryName);
+        public void Dispose() { }
+    }
+
+    [Fact]
+    public void AwsSdkForwardsOnlyWarningsAndErrorsIntoTheApplicationLog()
+    {
+        var provider = new RecordingProvider();
+        using var factory = LoggerFactory.Create(builder => builder.AddProvider(provider).SetMinimumLevel(LogLevel.Trace));
+        AwsSdkLogging.Configure().Attach(factory);
+        Assert.Equal(Amazon.LoggingOptions.SystemDiagnostics, Amazon.AWSConfigs.LoggingConfig.LogTo);
+        var sdk = Amazon.Runtime.Internal.Util.Logger.GetLogger(typeof(Amazon.S3.AmazonS3Client));
+        sdk.DebugFormat("RegionFinder resolved {0}", "us-east-1");
+        sdk.InfoFormat("AWSSDKUtils computed {0}", "a value");
+        var failure = new InvalidOperationException("storage failed");
+        sdk.Error(failure, "Request to {0} failed", "s3");
+        var entry = Assert.Single(provider.Entries);
+        Assert.StartsWith("Amazon", entry.Category);
+        Assert.Equal(LogLevel.Error, entry.Level);
+        Assert.Contains("Request to s3 failed", entry.Message);
+        Assert.Same(failure, entry.Exception);
+    }
+
     [Fact]
     public async Task MissingAuthorizationIsTheLfsChallengeNotAnError()
     {
